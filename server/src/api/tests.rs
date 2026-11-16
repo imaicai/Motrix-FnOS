@@ -51,6 +51,8 @@ async fn tcp_router_serves_web_ui_assets_and_api_on_the_desktop_entry_port() {
     for (uri, expected_body) in [
         ("/", "<html>motrix-ui</html>"),
         ("/assets/app.js", "console.log('motrix')"),
+        ("/app/motrix/", "<html>motrix-ui</html>"),
+        ("/app/motrix/assets/app.js", "console.log('motrix')"),
     ] {
         let response = app
             .clone()
@@ -69,16 +71,19 @@ async fn tcp_router_serves_web_ui_assets_and_api_on_the_desktop_entry_port() {
         assert_eq!(body.as_ref(), expected_body.as_bytes());
     }
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/app/ping")
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("response should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
+    for uri in ["/api/app/ping", "/app/motrix/api/app/ping"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should succeed");
+        assert_eq!(response.status(), StatusCode::OK, "health route at {uri}");
+    }
 }
 
 #[tokio::test]

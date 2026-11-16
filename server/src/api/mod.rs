@@ -95,7 +95,10 @@ fn ensure_compatible_management_request(
     request: &Request<Body>,
 ) -> Result<(), error::ApiError> {
     let path = request.uri().path();
-    let path = path.strip_prefix("/api").unwrap_or(path);
+    let path = path
+        .strip_prefix("/app/motrix/api")
+        .or_else(|| path.strip_prefix("/api"))
+        .unwrap_or(path);
     let writes = !matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
