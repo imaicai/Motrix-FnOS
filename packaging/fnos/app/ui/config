@@ -5,7 +5,7 @@
       "icon": "images/icon_{0}.png",
       "type": "iframe",
       "protocol": "",
-      "url": "/app/motrix/?v=2.0.7",
+      "url": "/app/motrix/?v=2.0.8",
       "allUsers": false,
       "control": {
         "accessPerm": "readonly",
