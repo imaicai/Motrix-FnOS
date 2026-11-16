@@ -29,6 +29,9 @@ jobs:
           git fetch --depth=1 upstream main
           echo "Upstream commit: $(git rev-parse FETCH_HEAD)"
           git checkout FETCH_HEAD -- .
+          # GitHub Actions default token cannot import other workflow files.
+          # Keep only our own workflow configuration until explicitly authorized.
+          git restore --source=HEAD --staged --worktree .github/workflows/
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to import."
