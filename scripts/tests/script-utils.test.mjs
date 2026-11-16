@@ -368,9 +368,9 @@ test('Aria2 checksum 解析忽略无效行并统一哈希大小写', () => {
 test('fnOS 同源网关配置不依赖 HTTP 17080 桌面 iframe', () => {
   const config = { '.url': { 'motrix.Application': {
     type: 'iframe', protocol: '', gatewayPrefix: '/app/motrix', gatewaySocket: 'app.sock',
-    url: '/app/motrix/?v=2.0.8', control: { accessPerm: 'editable', fullUrlPerm: 'readonly' }
+    url: '/app/motrix/', control: { accessPerm: 'readonly' }
   } } };
-  const expected = { entryId: 'motrix.Application', port: '17080', url: '/?v=2.0.8', accessPerm: 'editable' };
+  const expected = { entryId: 'motrix.Application', port: '17080', url: '/?v=2.0.9', accessPerm: 'editable' };
   assert.doesNotThrow(() => validatePortEntry(config, expected));
   const bad = structuredClone(config); bad['.url']['motrix.Application'].port = '17080';
   assert.throws(() => validatePortEntry(bad, expected), /不得使用 HTTP 端口/);

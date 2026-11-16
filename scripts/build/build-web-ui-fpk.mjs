@@ -10,7 +10,9 @@ const targetDir = path.join(repoRoot, 'packaging', 'fnos', 'app', 'ui', 'dist');
 const reuseDist = process.argv.includes('--reuse-dist');
 
 if (!reuseDist) {
-  await run('pnpm', ['exec', 'vite', 'build', '--logLevel', 'warn']);
+  // A stable absolute asset prefix is required for fnOS's /app/motrix launch URL.
+  // The management HTTP listener also serves this prefix, so standalone URLs keep working.
+  await run('pnpm', ['exec', 'vite', 'build', '--base', '/app/motrix/', '--logLevel', 'warn']);
 }
 if (!existsSync(path.join(sourceDir, 'index.html'))) {
   console.error(`Web UI 构建结果无效：${sourceDir} 缺少 index.html`);

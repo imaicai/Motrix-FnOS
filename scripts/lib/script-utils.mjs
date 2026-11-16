@@ -164,10 +164,10 @@ export function validatePortEntry(config, expected) {
     if (entry.protocol !== '' || Object.hasOwn(entry, 'port')) {
       throw new Error('fnOS 网关入口不得使用 HTTP 端口模式');
     }
-    if (entry.url !== `/app/motrix/${expected.url.slice(1)}`) {
+    if (entry.url !== '/app/motrix/') {
       throw new Error(`fnOS 网关入口 URL 无效：${entry.url}`);
     }
-    if (entry.control?.accessPerm !== 'editable' || entry.control?.fullUrlPerm !== 'readonly') {
+    if (entry.control?.accessPerm !== 'readonly') {
       throw new Error('fnOS 网关入口权限必须是 readonly');
     }
     return;

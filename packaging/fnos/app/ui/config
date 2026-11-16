@@ -5,13 +5,10 @@
       "icon": "images/icon_{0}.png",
       "type": "iframe",
       "protocol": "",
-      "url": "/app/motrix/?v=2.0.8",
+      "url": "/app/motrix/",
       "allUsers": false,
       "control": {
-        "accessPerm": "editable",
-        "fullUrlPerm": "readonly",
-        "portPerm": "readonly",
-        "pathPerm": "readonly"
+        "accessPerm": "readonly"
       },
       "gatewayPrefix": "/app/motrix",
       "gatewaySocket": "app.sock"

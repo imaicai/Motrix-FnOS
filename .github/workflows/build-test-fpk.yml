@@ -58,14 +58,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f packaging/fnos/dist/motrix_2.0.8_x86.fpk
-          test -f packaging/fnos/dist/motrix_2.0.8_arm.fpk
+          test -f packaging/fnos/dist/motrix_2.0.9_x86.fpk
+          test -f packaging/fnos/dist/motrix_2.0.9_arm.fpk
           pnpm run verify:fpk
           (cd packaging/fnos/dist && sha256sum *.fpk > SHA256SUMS.txt)
       - name: Upload verified FPK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: motrix-fnos-2.0.8-experimental-fpk
+          name: motrix-fnos-2.0.9-experimental-fpk
           path: |
             packaging/fnos/dist/*.fpk
             packaging/fnos/dist/SHA256SUMS.txt
@@ -77,18 +77,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag=v2.0.8-imaicai-test1
+          tag=v2.0.9-imaicai-test2
           cat > /tmp/fnos-test-release.md <<'NOTES'
-          Motrix FnOS v2.0.8 experimental build based on RockerHX/motrix-fnos 2.0.7.
+          Motrix FnOS v2.0.9 experimental build based on RockerHX/motrix-fnos 2.0.7.
           Attempts to fix blank iframe when launched from fnOS HTTPS desktop via a same-origin Unix Socket gateway.
           WARNING: Not fnOS hardware tested. Back up all app data first.
-          x86_64 NAS: motrix_2.0.8_x86.fpk
-          ARM64 NAS: motrix_2.0.8_arm.fpk
+          x86_64 NAS: motrix_2.0.9_x86.fpk
+          ARM64 NAS: motrix_2.0.9_arm.fpk
           See docs/fnos-desktop-gateway.md for installation, gateway validation, and rollback.
           NOTES
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" packaging/fnos/dist/*.fpk packaging/fnos/dist/SHA256SUMS.txt --clobber
             gh release edit "$tag" --notes-file /tmp/fnos-test-release.md --prerelease
           else
-            gh release create "$tag" packaging/fnos/dist/*.fpk packaging/fnos/dist/SHA256SUMS.txt --title 'Motrix FnOS 2.0.8 (experimental)' --notes-file /tmp/fnos-test-release.md --prerelease
+            gh release create "$tag" packaging/fnos/dist/*.fpk packaging/fnos/dist/SHA256SUMS.txt --title 'Motrix FnOS 2.0.9 (experimental)' --notes-file /tmp/fnos-test-release.md --prerelease
           fi

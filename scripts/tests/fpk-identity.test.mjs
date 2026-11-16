@@ -29,7 +29,7 @@ test('仓库 FPK 身份与 Release 产物名保持一致', () => {
   assert.match(manifestContent, /^os_min_version\s*=\s*1\.2\.0401$/m);
   assert.deepEqual(resource['api-scope'], ['trim.file.sharedAccess', 'trim.file.path']);
   assert.equal(uiConfig['.url']?.['motrix.Application']?.allUsers, false);
-  assert.equal(uiConfig['.url']?.['motrix.Application']?.control?.accessPerm, 'editable');
+  assert.equal(uiConfig['.url']?.['motrix.Application']?.control?.accessPerm, 'readonly');
 });
 
 test('双架构 FPK 预组装脚本保留生命周期和静态产物契约', () => {

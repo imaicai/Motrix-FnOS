@@ -35,7 +35,7 @@ export function readProjectVersions(files = versionFiles) {
     packageJson: packageJson.version,
     cargoToml: matchRequired(cargoToml, /^version\s*=\s*"([^"]+)"/m, files.cargoToml),
     manifestTemplate: matchRequired(manifestTemplate, /^version\s*=\s*(\S+)/m, files.manifestTemplate),
-    uiConfig: readUiCacheVersion(uiConfig, files.uiConfig),
+    uiConfig: readUiCacheVersion(uiConfig, files.uiConfig, packageJson.version),
   };
 }
 
@@ -68,8 +68,12 @@ export function setProjectVersion(version, files = versionFiles) {
 
   const uiConfig = readJson(files.uiConfig);
   const uiEntry = readUiEntry(uiConfig, files.uiConfig);
-  const prefix = uiEntry.url.startsWith("/app/motrix/") ? "/app/motrix/" : "/";
-  uiEntry.url = `${prefix}?v=${version}`;
+  // fnOS gateway registration requires a stable canonical launch URL.
+  // Only legacy port-mode entry URLs use a cache-busting version suffix.
+  if (uiEntry.url !== "/app/motrix/") {
+    const prefix = uiEntry.url.startsWith("/app/motrix/") ? "/app/motrix/" : "/";
+    uiEntry.url = `${prefix}?v=${version}`;
+  }
   writeJson(files.uiConfig, uiConfig);
 }
 
@@ -96,11 +100,12 @@ function writeJson(filePath, value) {
   writeText(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function readUiCacheVersion(uiConfig, filePath) {
+function readUiCacheVersion(uiConfig, filePath, packageVersion) {
   const url = readUiEntry(uiConfig, filePath).url;
   if (typeof url !== 'string') {
     throw new Error(`无法读取版本号：${filePath}`);
   }
+  if (url === '/app/motrix/') return packageVersion;
   return matchRequired(url, /^\/(?:app\/motrix\/)?\?v=(\d+\.\d+\.\d+(?:-beta)?)$/, filePath);
 }
 

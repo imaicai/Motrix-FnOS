@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.0.9 - 2026-11-16
+
+### Fixed
+
+- Use the official stable fnOS gateway launch URL `/app/motrix/` without a version query.
+- Compile FPK static assets with the canonical absolute `/app/motrix/` prefix to avoid missing scripts and styles in embedded windows.
+- Simplify desktop entry controls to the documented read-only gateway configuration.
+
+### Documentation
+
+- Added targeted gateway, Unix Socket, and asset-path checks for blank fnOS windows.
 ## 2.0.8 - 2026-11-16
 
 ### Fixed

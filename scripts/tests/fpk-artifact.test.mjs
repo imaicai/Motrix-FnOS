@@ -134,10 +134,10 @@ function validateArtifact({ file, platform, machine }, extractionRoot) {
   assert.equal(desktopEntry?.type, 'iframe');
   assert.equal(desktopEntry?.gatewayPrefix, '/app/motrix');
   assert.equal(desktopEntry?.gatewaySocket, 'app.sock');
-  assert.equal(desktopEntry?.url, `/app/motrix/?v=${packageVersion}`);
+  assert.equal(desktopEntry?.url, '/app/motrix/');
   assert.equal(desktopEntry?.protocol, '');
   assert.equal(Object.hasOwn(desktopEntry, 'port'), false, 'HTTPS 网关入口不应保留 HTTP 端口');
-  assert.equal(desktopEntry?.control?.accessPerm, 'editable');
+  assert.equal(desktopEntry?.control?.accessPerm, 'readonly');
   assert.match(readFileSync(path.join(packageRoot, 'cmd/common.sh'), 'utf8'), /MOTRIX_FNOS_GATEWAY_SOCKET/);
   assert.deepEqual(readdirSync(path.join(appRoot, 'data')), [], 'app/data 不得携带运行时残留');
   assertFrontendContainsNoFnosApiSecrets(path.join(appRoot, 'ui/dist'));
