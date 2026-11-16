@@ -43,7 +43,7 @@ const flows = [
   ['Web 构建', 'build/build-web.mjs', [], [
     ['vue-tsc', '--noEmit'], ['vite', 'build', '--logLevel', 'warn'],
   ]],
-  ['FPK Web 构建', 'build/build-web-ui-fpk.mjs', [], [['pnpm', 'exec', 'vite', 'build', '--logLevel', 'warn']]],
+  ['FPK Web 构建', 'build/build-web-ui-fpk.mjs', [], [['pnpm', 'exec', 'vite', 'build', '--base', '/app/motrix/', '--logLevel', 'warn']]],
   ['FPK Web 复用', 'build/build-web-ui-fpk.mjs', ['--reuse-dist'], []],
   ...[false, true].map((reuse) => [
     `单架构 FPK ${reuse ? '复用 UI' : '构建 UI'}`, 'build/build-fpk.mjs',
