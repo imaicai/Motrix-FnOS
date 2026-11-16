@@ -53,6 +53,7 @@ prepare_runtime_dirs() {
 export_runtime_env() {
   export MOTRIX_FNOS_APP_DATA_DIR="${APP_DATA_DIR}"
   export MOTRIX_FNOS_HTTP_ADDR="${HTTP_ADDR}"
+  export MOTRIX_FNOS_GATEWAY_SOCKET="${APP_DEST}/app.sock"
   export MOTRIX_FNOS_JSONRPC_ADDR="${JSONRPC_ADDR}"
   export MOTRIX_FNOS_LAN_JSONRPC_ADDR="${LAN_JSONRPC_ADDR}"
   export MOTRIX_FNOS_ARIA2_PATH="${ARIA2_BIN}"

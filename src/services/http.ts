@@ -1,4 +1,5 @@
 import { t } from "../i18n";
+import { resolveApiPath } from "./apiBase";
 
 export interface ApiErrorResponse {
   code: string;
@@ -50,7 +51,7 @@ export function setUnauthorizedHandler(
 async function request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
   const hasJsonBody = options.body !== undefined;
   const accessToken = options.includeAuth === false ? null : accessTokenProvider?.() ?? null;
-  const response = await fetch(path, {
+  const response = await fetch(resolveApiPath(path), {
     method,
     // Preserve same-origin gateway cookies; Motrix itself authenticates with Bearer JWT.
     credentials: "same-origin",
