@@ -159,7 +159,7 @@ export function validatePortEntry(config, expected) {
   }
   if (entry.gatewayPrefix !== undefined || entry.gatewaySocket !== undefined) {
     if (entry.gatewayPrefix !== '/app/motrix' || entry.gatewaySocket !== 'app.sock') {
-      throw new Error('fnOS 网关入口路径或 Socket 无效');
+      throw new Error('不得声明 gatewayPrefix 或 gatewaySocket，除非使用 /app/motrix + app.sock');
     }
     if (entry.protocol !== '' || Object.hasOwn(entry, 'port')) {
       throw new Error('fnOS 网关入口不得使用 HTTP 端口模式');
@@ -167,7 +167,7 @@ export function validatePortEntry(config, expected) {
     if (entry.url !== `/app/motrix/${expected.url.slice(1)}`) {
       throw new Error(`fnOS 网关入口 URL 无效：${entry.url}`);
     }
-    if (entry.control?.accessPerm !== 'readonly' || entry.control?.fullUrlPerm !== 'readonly') {
+    if (entry.control?.accessPerm !== 'editable' || entry.control?.fullUrlPerm !== 'readonly') {
       throw new Error('fnOS 网关入口权限必须是 readonly');
     }
     return;

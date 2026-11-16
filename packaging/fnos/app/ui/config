@@ -8,7 +8,7 @@
       "url": "/app/motrix/?v=2.0.8",
       "allUsers": false,
       "control": {
-        "accessPerm": "readonly",
+        "accessPerm": "editable",
         "fullUrlPerm": "readonly",
         "portPerm": "readonly",
         "pathPerm": "readonly"

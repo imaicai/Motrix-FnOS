@@ -25,18 +25,18 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout patched repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Setup Rust and targets
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.99.1
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b0f76dfb45f55f8421693e4803ac7bb65143bd34 # v6
         with:
           version: 12.16.1
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version-file: .node-version
           cache: pnpm
@@ -63,7 +63,7 @@ jobs:
           pnpm run verify:fpk
           (cd packaging/fnos/dist && sha256sum *.fpk > SHA256SUMS.txt)
       - name: Upload verified FPK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: motrix-fnos-2.0.8-experimental-fpk
           path: |
