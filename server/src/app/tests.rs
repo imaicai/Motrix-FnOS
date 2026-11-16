@@ -1,0 +1,1296 @@
+use super::*;
+use crate::aria2::ARIA2_LOG_MAX_BYTES;
+use crate::database::task_operations::{begin_task_operation, list_unfinished_task_operations};
+use crate::database::tasks::list_download_tasks;
+use crate::database::tasks::upsert_download_task;
+use crate::settings::service::{
+    load_json_rpc_token, save_json_rpc_token, save_lan_json_rpc_config,
+};
+use crate::tasks::{
+    DownloadTask, DownloadTaskStatus, TaskOperation, TaskOperationContext, TaskOperationType,
+};
+use crate::test_support::AuthServiceTestExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+pub(crate) fn replace_fnos_api_client(state: &HttpAppState, client: FnosApiClient) {
+    *state
+        .fnos_api_client
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = client;
+}
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[test]
+fn runtime_config_uses_explicit_env_values() {
+    let _guard = env_lock().lock().expect("env lock should succeed");
+    let temp_dir = std::env::temp_dir().join(format!("motrix-fnos-app-config-{}", now_ms()));
+    let aria2_path = temp_dir.join("aria2-next");
+
+    std::env::set_var(APP_DATA_DIR_ENV, &temp_dir);
+    std::env::set_var(HTTP_ADDR_ENV, "127.0.0.1:18080");
+    std::env::set_var(JSONRPC_ADDR_ENV, "127.1.2.3:18081");
+    std::env::set_var(LAN_JSONRPC_ADDR_ENV, "127.0.0.1:18082");
+    std::env::set_var(ARIA2_PATH_ENV, &aria2_path);
+    std::env::remove_var(ACCESSIBLE_PATHS_FILE_ENV);
+    std::env::set_var(TRUSTED_PROXY_IPS_ENV, "192.0.2.10, ::1, 192.0.2.10");
+
+    let config = ServerRuntimeConfig::from_env().expect("config should load");
+
+    assert_eq!(config.app_data_dir, temp_dir);
+    assert_eq!(
+        config.database_path,
+        config.app_data_dir.join(DATABASE_FILE_NAME)
+    );
+    assert_eq!(
+        config.accessible_paths_path,
+        config.app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME)
+    );
+    assert_eq!(config.http_addr.to_string(), "127.0.0.1:18080");
+    assert_eq!(config.jsonrpc_addr.to_string(), "127.1.2.3:18081");
+    assert_eq!(config.lan_jsonrpc_addr.to_string(), "127.0.0.1:18082");
+    assert_eq!(config.aria2_path.as_deref(), Some(aria2_path.as_path()));
+    assert_eq!(
+        config.trusted_proxy_ips,
+        vec![
+            "192.0.2.10"
+                .parse::<std::net::IpAddr>()
+                .expect("proxy should parse"),
+            "::1"
+                .parse::<std::net::IpAddr>()
+                .expect("proxy should parse"),
+        ]
+    );
+
+    std::env::remove_var(APP_DATA_DIR_ENV);
+    std::env::remove_var(HTTP_ADDR_ENV);
+    std::env::remove_var(JSONRPC_ADDR_ENV);
+    std::env::remove_var(LAN_JSONRPC_ADDR_ENV);
+    std::env::remove_var(ARIA2_PATH_ENV);
+    std::env::remove_var(ACCESSIBLE_PATHS_FILE_ENV);
+    std::env::remove_var(TRUSTED_PROXY_IPS_ENV);
+}
+
+#[test]
+fn runtime_config_uses_default_listener_addresses() {
+    let _guard = env_lock().lock().expect("env lock should succeed");
+    let temp_dir = std::env::temp_dir().join(format!("motrix-fnos-default-config-{}", now_ms()));
+    std::env::set_var(APP_DATA_DIR_ENV, &temp_dir);
+    std::env::remove_var(HTTP_ADDR_ENV);
+    std::env::remove_var(JSONRPC_ADDR_ENV);
+    std::env::remove_var(LAN_JSONRPC_ADDR_ENV);
+    std::env::remove_var(TRUSTED_PROXY_IPS_ENV);
+
+    let config = ServerRuntimeConfig::from_env().expect("config should load");
+
+    assert_eq!(config.http_addr.to_string(), DEFAULT_HTTP_ADDR);
+    assert_eq!(config.jsonrpc_addr.to_string(), DEFAULT_JSONRPC_ADDR);
+    assert_eq!(
+        config.lan_jsonrpc_addr.to_string(),
+        DEFAULT_LAN_JSONRPC_ADDR
+    );
+
+    std::env::remove_var(APP_DATA_DIR_ENV);
+}
+
+#[test]
+fn runtime_config_rejects_invalid_lan_jsonrpc_address() {
+    let _guard = env_lock().lock().expect("env lock should succeed");
+    std::env::set_var(LAN_JSONRPC_ADDR_ENV, "not-an-address");
+
+    let error = ServerRuntimeConfig::from_env().expect_err("address should be rejected");
+
+    assert!(error.contains("解析局域网 JSON-RPC 监听地址失败"));
+    std::env::remove_var(LAN_JSONRPC_ADDR_ENV);
+}
+
+#[test]
+fn runtime_config_rejects_invalid_or_non_loopback_jsonrpc_addresses() {
+    let _guard = env_lock().lock().expect("env lock should succeed");
+    for (value, expected_message) in [
+        ("not-an-address", "解析 JSON-RPC 监听地址失败"),
+        ("0.0.0.0:17081", "JSON-RPC 监听地址必须使用回环 IP"),
+        ("192.168.1.10:17081", "JSON-RPC 监听地址必须使用回环 IP"),
+        ("203.0.113.10:17081", "JSON-RPC 监听地址必须使用回环 IP"),
+    ] {
+        std::env::set_var(JSONRPC_ADDR_ENV, value);
+        let error = ServerRuntimeConfig::from_env().expect_err("address should be rejected");
+        assert!(error.contains(expected_message), "error: {error}");
+    }
+    std::env::remove_var(JSONRPC_ADDR_ENV);
+}
+
+#[test]
+fn runtime_config_accepts_ipv4_and_ipv6_loopback_jsonrpc_addresses() {
+    let _guard = env_lock().lock().expect("env lock should succeed");
+    for value in ["127.0.0.1:17081", "[::1]:17081"] {
+        std::env::set_var(JSONRPC_ADDR_ENV, value);
+        let config = ServerRuntimeConfig::from_env().expect("loopback address should load");
+        assert!(config.jsonrpc_addr.ip().is_loopback());
+    }
+    std::env::remove_var(JSONRPC_ADDR_ENV);
+}
+
+#[test]
+fn runtime_config_rejects_invalid_trusted_proxy_addresses() {
+    let _guard = env_lock().lock().expect("env lock should succeed");
+    std::env::set_var(TRUSTED_PROXY_IPS_ENV, "192.0.2.10,not-an-ip");
+
+    let error = ServerRuntimeConfig::from_env().expect_err("proxy address should be rejected");
+
+    assert!(error.contains("解析可信代理地址失败"));
+    std::env::remove_var(TRUSTED_PROXY_IPS_ENV);
+}
+
+#[test]
+fn bootstrap_http_app_state_restores_database_state() {
+    tokio::runtime::Runtime::new()
+        .expect("tokio runtime should create")
+        .block_on(async {
+            let app_data_dir =
+                std::env::temp_dir().join(format!("motrix-fnos-http-app-state-{}", now_ms()));
+            let runtime = ServerRuntimeConfig {
+                database_path: app_data_dir.join(DATABASE_FILE_NAME),
+                accessible_paths_path: app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME),
+                app_data_dir: app_data_dir.clone(),
+                http_addr: DEFAULT_HTTP_ADDR.parse().expect("addr should parse"),
+                jsonrpc_addr: DEFAULT_JSONRPC_ADDR.parse().expect("addr should parse"),
+                lan_jsonrpc_addr: DEFAULT_LAN_JSONRPC_ADDR.parse().expect("addr should parse"),
+                aria2_path: Some(crate::test_support::native_version_only_engine(
+                    &app_data_dir,
+                )),
+                trusted_proxy_ips: Vec::new(),
+            };
+
+            let database = connect_database(runtime.database_path.clone())
+                .await
+                .expect("database should connect");
+            let task = sample_task();
+            upsert_download_task(&database.pool, &task)
+                .await
+                .expect("task should persist");
+            database.pool.close().await;
+
+            let state = bootstrap_http_app_state(&runtime)
+                .await
+                .expect("state should bootstrap");
+
+            let tasks = state.core.download_tasks.list().expect("tasks should lock");
+
+            assert_eq!(state.runtime.app_data_dir, app_data_dir);
+            assert_eq!(state.runtime.http_addr.to_string(), DEFAULT_HTTP_ADDR);
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].id, task.id);
+            assert_eq!(state.core.next_task_id.load(Ordering::SeqCst), task.id + 1);
+
+            state.core.database.pool.close().await;
+            let _ = std::fs::remove_file(&runtime.database_path);
+            let _ = std::fs::remove_dir_all(&runtime.app_data_dir);
+        });
+}
+
+#[tokio::test]
+async fn bootstrap_without_pending_file_cleanup_keeps_state_exclusively_owned() {
+    let app_data_dir = std::env::temp_dir().join(format!(
+        "motrix-fnos-bootstrap-no-file-cleanup-{}",
+        now_ms()
+    ));
+    let runtime = ServerRuntimeConfig {
+        database_path: app_data_dir.join(DATABASE_FILE_NAME),
+        accessible_paths_path: app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME),
+        app_data_dir: app_data_dir.clone(),
+        http_addr: "127.0.0.1:0".parse().expect("address should parse"),
+        jsonrpc_addr: "127.0.0.1:0".parse().expect("address should parse"),
+        lan_jsonrpc_addr: "127.0.0.1:0".parse().expect("address should parse"),
+        aria2_path: Some(crate::test_support::native_version_only_engine(
+            &app_data_dir,
+        )),
+        trusted_proxy_ips: Vec::new(),
+    };
+
+    let mut state = bootstrap_http_app_state(&runtime)
+        .await
+        .expect("state should bootstrap");
+
+    assert!(std::sync::Arc::get_mut(&mut state).is_some());
+
+    state.core.database.pool.close().await;
+    drop(state);
+    let _ = std::fs::remove_dir_all(app_data_dir);
+}
+
+#[tokio::test]
+async fn bootstrap_trims_oversized_aria2_log_without_starting_aria2() {
+    let app_data_dir = std::env::temp_dir().join(format!(
+        "motrix-fnos-bootstrap-log-maintenance-{}",
+        now_ms()
+    ));
+    let log_path = app_data_dir.join("aria2").join("aria2.log");
+    std::fs::create_dir_all(log_path.parent().expect("log should have parent"))
+        .expect("log directory should create");
+    let log = std::fs::File::create(&log_path).expect("log should create");
+    log.set_len(ARIA2_LOG_MAX_BYTES + 1)
+        .expect("log should size");
+    drop(log);
+    let runtime = ServerRuntimeConfig {
+        database_path: app_data_dir.join(DATABASE_FILE_NAME),
+        accessible_paths_path: app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME),
+        app_data_dir: app_data_dir.clone(),
+        http_addr: "127.0.0.1:0".parse().expect("address should parse"),
+        jsonrpc_addr: "127.0.0.1:0".parse().expect("address should parse"),
+        lan_jsonrpc_addr: "127.0.0.1:0".parse().expect("address should parse"),
+        aria2_path: Some(crate::test_support::native_version_only_engine(
+            &app_data_dir,
+        )),
+        trusted_proxy_ips: Vec::new(),
+    };
+
+    let state = bootstrap_http_app_state(&runtime)
+        .await
+        .expect("state should bootstrap");
+
+    assert_eq!(
+        std::fs::metadata(&log_path)
+            .expect("log should exist")
+            .len(),
+        ARIA2_LOG_MAX_BYTES
+    );
+    assert!(state
+        .aria2_process
+        .lock()
+        .expect("process lock should succeed")
+        .is_none());
+    assert!(state.aria2_runtime_snapshot().is_none());
+
+    state.core.database.pool.close().await;
+    drop(state);
+    let _ = std::fs::remove_dir_all(app_data_dir);
+}
+
+#[tokio::test]
+async fn bootstrap_reconciles_prepared_operation_without_starting_aria2() {
+    let app_data_dir =
+        std::env::temp_dir().join(format!("motrix-fnos-bootstrap-prepared-{}", now_ms()));
+    let runtime = listener_runtime(
+        "127.0.0.1:0".parse().expect("address should parse"),
+        "127.0.0.1:0".parse().expect("address should parse"),
+    );
+    let runtime = ServerRuntimeConfig {
+        app_data_dir: app_data_dir.clone(),
+        database_path: app_data_dir.join(DATABASE_FILE_NAME),
+        accessible_paths_path: app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME),
+        aria2_path: Some(crate::test_support::native_version_only_engine(
+            &app_data_dir,
+        )),
+        ..runtime
+    };
+    let database = connect_database(runtime.database_path.clone())
+        .await
+        .expect("database should connect");
+    let task = sample_task();
+    upsert_download_task(&database.pool, &task)
+        .await
+        .expect("task should persist");
+    let operation = TaskOperation::with_id(
+        "bootstrap-prepared-operation",
+        task.id,
+        TaskOperationType::Create,
+        "prepared",
+        TaskOperationContext::default(),
+    );
+    begin_task_operation(&database.pool, &operation)
+        .await
+        .expect("operation should persist");
+    database.pool.close().await;
+
+    let state = bootstrap_http_app_state(&runtime)
+        .await
+        .expect("prepared operation should reconcile");
+
+    assert!(state.aria2_runtime_snapshot().is_none());
+    assert!(list_unfinished_task_operations(&state.core.database.pool)
+        .await
+        .expect("unfinished operations should list")
+        .is_empty());
+
+    state.core.database.pool.close().await;
+    let _ = std::fs::remove_dir_all(runtime.app_data_dir);
+}
+
+#[tokio::test]
+async fn bootstrap_preserves_manual_review_after_restart_without_starting_aria2() {
+    let app_data_dir =
+        std::env::temp_dir().join(format!("motrix-fnos-bootstrap-manual-{}", now_ms()));
+    let runtime = listener_runtime(
+        "127.0.0.1:0".parse().expect("address should parse"),
+        "127.0.0.1:0".parse().expect("address should parse"),
+    );
+    let runtime = ServerRuntimeConfig {
+        app_data_dir: app_data_dir.clone(),
+        database_path: app_data_dir.join(DATABASE_FILE_NAME),
+        accessible_paths_path: app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME),
+        aria2_path: Some(crate::test_support::native_version_only_engine(
+            &app_data_dir,
+        )),
+        ..runtime
+    };
+    let database = connect_database(runtime.database_path.clone())
+        .await
+        .expect("database should connect");
+    let task = sample_task();
+    upsert_download_task(&database.pool, &task)
+        .await
+        .expect("task should persist");
+    let mut operation = TaskOperation::with_id(
+        "bootstrap-manual-review-operation",
+        task.id,
+        TaskOperationType::Redownload,
+        "files_staged",
+        TaskOperationContext::default(),
+    );
+    operation.require_manual_review("startup_manual_review", "用户文件需要人工确认");
+    begin_task_operation(&database.pool, &operation)
+        .await
+        .expect("manual review operation should persist");
+    database.pool.close().await;
+
+    let state = bootstrap_http_app_state(&runtime)
+        .await
+        .expect("manual review should survive restart");
+
+    assert!(state.aria2_runtime_snapshot().is_none());
+    assert_eq!(
+        state.core.download_tasks.list().expect("tasks should list")[0].id,
+        task.id
+    );
+    let unfinished = list_unfinished_task_operations(&state.core.database.pool)
+        .await
+        .expect("unfinished operations should list");
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(
+        unfinished[0].status,
+        crate::tasks::TaskOperationStatus::ManualReview
+    );
+
+    state.core.database.pool.close().await;
+    let _ = std::fs::remove_dir_all(runtime.app_data_dir);
+}
+
+#[test]
+fn request_shutdown_marks_exiting_and_broadcasts_event() {
+    let temp_dir = std::env::temp_dir().join(format!("motrix-fnos-shutdown-{}", now_ms()));
+    let runtime = ServerRuntimeConfig {
+        database_path: temp_dir.join(DATABASE_FILE_NAME),
+        accessible_paths_path: temp_dir.join(ACCESSIBLE_PATHS_FILE_NAME),
+        app_data_dir: temp_dir,
+        http_addr: DEFAULT_HTTP_ADDR.parse().expect("addr should parse"),
+        jsonrpc_addr: DEFAULT_JSONRPC_ADDR.parse().expect("addr should parse"),
+        lan_jsonrpc_addr: DEFAULT_LAN_JSONRPC_ADDR.parse().expect("addr should parse"),
+        aria2_path: None,
+        trusted_proxy_ips: Vec::new(),
+    };
+    let database = tokio::runtime::Runtime::new()
+        .expect("tokio runtime should create")
+        .block_on(async { connect_database(runtime.database_path.clone()).await })
+        .expect("database should connect");
+    let state = HttpAppState::new(ServerState::new(database, Vec::new(), 1), runtime);
+    let mut receiver = state.runtime_events.subscribe();
+
+    state.request_shutdown("收到停止信号");
+
+    assert!(state.core.shutdown.is_exiting());
+    let event = receiver.try_recv().expect("event should be broadcast");
+    match event {
+        RuntimeEvent::RuntimeExiting(payload) => {
+            assert_eq!(payload.reason, "收到停止信号");
+            assert!(payload.timestamp > 0);
+        }
+        other => panic!("unexpected event: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn listener_binding_fails_without_starting_jsonrpc_when_management_port_is_occupied() {
+    let occupied_management = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("management port should bind");
+    let management_addr = occupied_management
+        .local_addr()
+        .expect("management address should read");
+    let jsonrpc_addr = reserve_local_addr().await;
+    let runtime = listener_runtime(management_addr, jsonrpc_addr);
+
+    let error = bind_http_listeners(&runtime)
+        .await
+        .expect_err("management binding should fail");
+
+    assert!(error.contains("绑定管理监听地址失败"));
+    assert!(error.contains(&management_addr.to_string()));
+    TcpListener::bind(jsonrpc_addr)
+        .await
+        .expect("jsonrpc port should remain available");
+}
+
+#[tokio::test]
+async fn listener_binding_releases_management_when_jsonrpc_port_is_occupied() {
+    let management_addr = reserve_local_addr().await;
+    let occupied_jsonrpc = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("jsonrpc port should bind");
+    let jsonrpc_addr = occupied_jsonrpc
+        .local_addr()
+        .expect("jsonrpc address should read");
+    let runtime = listener_runtime(management_addr, jsonrpc_addr);
+
+    let error = bind_http_listeners(&runtime)
+        .await
+        .expect_err("jsonrpc binding should fail");
+
+    assert!(error.contains("绑定 JSON-RPC 监听地址失败"));
+    assert!(error.contains(&jsonrpc_addr.to_string()));
+    TcpListener::bind(management_addr)
+        .await
+        .expect("management port should be released after failure");
+}
+
+#[tokio::test]
+async fn occupied_lan_jsonrpc_port_keeps_management_and_loopback_available() {
+    let management_addr = reserve_local_addr().await;
+    let jsonrpc_addr = reserve_local_addr().await;
+    let occupied_lan_jsonrpc = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("LAN JSON-RPC port should bind");
+    let lan_jsonrpc_addr = occupied_lan_jsonrpc
+        .local_addr()
+        .expect("LAN JSON-RPC address should read");
+    let mut runtime = listener_runtime(management_addr, jsonrpc_addr);
+    runtime.lan_jsonrpc_addr = lan_jsonrpc_addr;
+
+    let state = bootstrap_http_app_state(&runtime)
+        .await
+        .expect("state should bootstrap");
+    let config = LanJsonRpcConfig {
+        enabled: true,
+        token: "preserved-lan-token".to_string(),
+        allow_shared_address_space: true,
+    };
+    save_lan_json_rpc_config(&state.core.database.pool, &config)
+        .await
+        .expect("LAN config should save");
+    *state.lan_json_rpc_config.write().await = config.clone();
+    let auth = state
+        .auth
+        .service
+        .setup("test management password")
+        .await
+        .expect("auth should initialize");
+    let token = state.auth.service.issue_admin_token(&auth).await.unwrap();
+    let listeners = bind_http_listeners(&runtime)
+        .await
+        .expect("LAN port conflict should allow startup");
+    assert!(listeners.lan_jsonrpc.is_none());
+    state.mark_listeners_ready();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<String>();
+    let serving_state = state.clone();
+    let server = tokio::spawn(async move {
+        serve_http_listeners(serving_state, listeners, async move {
+            shutdown_receiver.await.map_err(|error| error.to_string())
+        })
+        .await
+    });
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!("http://{management_addr}/api/app/ready"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let status = client
+        .get(format!("http://{management_addr}/api/settings/lan-jsonrpc"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(status["available"], false);
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["allowSharedAddressSpace"], true);
+    let response = client
+        .put(format!("http://{management_addr}/api/settings/lan-jsonrpc"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "enabled": true, "allowSharedAddressSpace": true }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(response["status"]["available"], false);
+    assert_eq!(response["issuedToken"], serde_json::Value::Null);
+    assert_eq!(
+        load_lan_json_rpc_config(&state.core.database.pool)
+            .await
+            .unwrap(),
+        config
+    );
+    let version = client
+        .post(format!("http://{jsonrpc_addr}/jsonrpc"))
+        .json(&serde_json::json!({ "jsonrpc": "2.0", "id": "version", "method": "aria2.getVersion", "params": [] }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert!(version.get("result").is_some());
+    assert!(state.core.debug_logs.list().iter().any(|entry| {
+        entry.level == crate::debug_logs::DebugLogLevel::Warn
+            && entry.message.contains("局域网 JSON-RPC 不可用：端口被占用")
+    }));
+    assert!(state.aria2_runtime_snapshot().is_none());
+    shutdown_sender
+        .send("测试降级服务停止".to_string())
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap(),
+        Ok(())
+    );
+    assert_listener_closed(management_addr).await;
+    assert_listener_closed(jsonrpc_addr).await;
+    assert_eq!(
+        state
+            .core
+            .debug_logs
+            .list()
+            .iter()
+            .filter(|entry| {
+                entry.module == "runtime.exit" && entry.message == "开始执行统一退出流程"
+            })
+            .count(),
+        1
+    );
+    assert!(tokio::net::TcpStream::connect(lan_jsonrpc_addr)
+        .await
+        .is_ok());
+    drop(occupied_lan_jsonrpc);
+    let listeners = bind_http_listeners(&runtime)
+        .await
+        .expect("released LAN port should bind on restart");
+    assert!(listeners.lan_jsonrpc.is_some());
+    state.core.database.pool.close().await;
+    let _ = std::fs::remove_dir_all(&runtime.app_data_dir);
+}
+
+#[tokio::test]
+async fn non_conflict_lan_jsonrpc_bind_error_still_releases_other_ports() {
+    let management_addr = reserve_local_addr().await;
+    let jsonrpc_addr = reserve_local_addr().await;
+    let mut runtime = listener_runtime(management_addr, jsonrpc_addr);
+    runtime.lan_jsonrpc_addr = "192.0.2.1:17082".parse().unwrap();
+    let error = bind_http_listeners(&runtime)
+        .await
+        .expect_err("non-local address must not degrade silently");
+    assert!(error.contains("绑定局域网 JSON-RPC 监听地址失败"));
+    TcpListener::bind(management_addr)
+        .await
+        .expect("management port should be released after failure");
+    TcpListener::bind(jsonrpc_addr)
+        .await
+        .expect("JSON-RPC port should be released after failure");
+}
+
+#[tokio::test]
+async fn ipv6_management_listener_rebinds_after_closing_an_accepted_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let listener = bind_ipv6_management_listener(0).expect("IPv6 listener should bind");
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            bind_ipv6_management_listener(port).is_err(),
+            "a running listener must retain exclusive ownership of its port"
+        );
+
+        let mut client = tokio::net::TcpStream::connect((Ipv6Addr::LOCALHOST, port))
+            .await
+            .expect("IPv6 client should connect");
+        let (mut connection, _) = listener.accept().await.unwrap();
+        // 服务端先关闭连接，使旧连接进入 TIME_WAIT，覆盖应用停用后立即启用的场景。
+        connection.shutdown().await.unwrap();
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+        drop(client);
+        drop(connection);
+        drop(listener);
+
+        let listener = bind_ipv6_management_listener(port)
+            .expect("IPv6 management port should rebind without waiting for TIME_WAIT to expire");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    })
+    .await
+    .expect("IPv6 close and rebind should finish within the deadline");
+}
+
+#[tokio::test]
+async fn wildcard_management_listener_serves_ipv4_and_ipv6() {
+    let runtime = listener_runtime(
+        "0.0.0.0:0".parse().expect("address should parse"),
+        "127.0.0.1:0".parse().expect("address should parse"),
+    );
+    let state = bootstrap_http_app_state(&runtime)
+        .await
+        .expect("state should bootstrap");
+    let listeners = bind_http_listeners(&runtime)
+        .await
+        .expect("listeners should bind");
+    state.mark_listeners_ready();
+    let management_port = listeners
+        .management
+        .local_addr()
+        .expect("management address should read")
+        .port();
+    let management_ipv6_addr = listeners
+        .management_ipv6
+        .as_ref()
+        .expect("wildcard management listener should bind IPv6")
+        .local_addr()
+        .expect("IPv6 management address should read");
+    assert_eq!(management_ipv6_addr.port(), management_port);
+    let lan_jsonrpc_port = listeners
+        .lan_jsonrpc
+        .as_ref()
+        .expect("LAN listener should be available")
+        .local_addr()
+        .expect("LAN JSON-RPC address should read")
+        .port();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<String>();
+    let serving_state = state.clone();
+    let server = tokio::spawn(async move {
+        serve_http_listeners(serving_state, listeners, async move {
+            shutdown_receiver
+                .await
+                .map_err(|error| format!("测试停止信号丢失：{}", error))
+        })
+        .await
+    });
+    let client = reqwest::Client::new();
+
+    for address in [
+        format!("http://127.0.0.1:{management_port}"),
+        format!("http://[::1]:{management_port}"),
+    ] {
+        let response = client
+            .get(format!("{address}/api/auth/status"))
+            .send()
+            .await
+            .expect("management API should respond");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+    assert!(
+        tokio::net::TcpStream::connect(format!("[::1]:{lan_jsonrpc_port}"))
+            .await
+            .is_err()
+    );
+
+    shutdown_sender
+        .send("测试双栈管理监听器停止".to_string())
+        .expect("shutdown signal should send");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("server should stop before timeout")
+        .expect("server task should join");
+    assert_eq!(result, Ok(()));
+    drop(client);
+    assert_listener_closed(
+        format!("127.0.0.1:{management_port}")
+            .parse()
+            .expect("IPv4 management address should parse"),
+    )
+    .await;
+    assert_listener_closed(
+        format!("[::1]:{management_port}")
+            .parse()
+            .expect("IPv6 management address should parse"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn three_listeners_serve_isolated_routes_and_cleanup_once() {
+    let runtime = listener_runtime(
+        "127.0.0.1:0".parse().expect("address should parse"),
+        "127.0.0.1:0".parse().expect("address should parse"),
+    );
+    let state = bootstrap_http_app_state(&runtime)
+        .await
+        .expect("state should bootstrap");
+    let listeners = bind_http_listeners(&runtime)
+        .await
+        .expect("listeners should bind");
+    state.mark_listeners_ready();
+    let management_addr = listeners
+        .management
+        .local_addr()
+        .expect("management address should read");
+    let jsonrpc_addr = listeners
+        .jsonrpc
+        .local_addr()
+        .expect("jsonrpc address should read");
+    let lan_jsonrpc_addr = listeners
+        .lan_jsonrpc
+        .as_ref()
+        .expect("LAN listener should be available")
+        .local_addr()
+        .expect("LAN JSON-RPC address should read");
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<String>();
+    let serving_state = state.clone();
+    let server = tokio::spawn(async move {
+        serve_http_listeners(serving_state, listeners, async move {
+            shutdown_receiver
+                .await
+                .map_err(|error| format!("测试停止信号丢失：{}", error))
+        })
+        .await
+    });
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("http://{management_addr}/api/app/ping"))
+        .send()
+        .await
+        .expect("management API should respond");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let response = client
+        .get(format!("http://{management_addr}/api/auth/status"))
+        .send()
+        .await
+        .expect("management auth status should respond");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = client
+        .get(format!("http://{management_addr}/api/app/ready"))
+        .send()
+        .await
+        .expect("management readiness should respond");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = client
+        .get(format!("http://{jsonrpc_addr}/api/app/ping"))
+        .send()
+        .await
+        .expect("jsonrpc management path should respond");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let response = client
+        .post(format!("http://{jsonrpc_addr}/jsonrpc"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-version",
+            "method": "system.unsupported",
+            "params": []
+        }))
+        .send()
+        .await
+        .expect("jsonrpc request should respond");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("jsonrpc response should deserialize");
+    assert_eq!(payload["id"], "rpc-version");
+    assert_eq!(payload["error"]["code"], -32601);
+
+    let response = client
+        .post(format!("http://{lan_jsonrpc_addr}/jsonrpc"))
+        .body("not-json")
+        .send()
+        .await
+        .expect("disabled LAN JSON-RPC should respond");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    *state.lan_json_rpc_config.write().await = crate::settings::service::LanJsonRpcConfig {
+        enabled: true,
+        token: "lan-secret".to_string(),
+        allow_shared_address_space: false,
+    };
+    let response = client
+        .post(format!("http://{lan_jsonrpc_addr}/jsonrpc"))
+        .header("x-forwarded-for", "192.168.1.12")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "lan-loopback",
+            "method": "aria2.getVersion",
+            "params": []
+        }))
+        .send()
+        .await
+        .expect("loopback LAN JSON-RPC should respond");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    shutdown_sender
+        .send("测试三监听器停止".to_string())
+        .expect("shutdown signal should send");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("server should stop before timeout")
+        .expect("server task should join");
+    assert_eq!(result, Ok(()));
+
+    drop(client);
+    assert_listener_closed(management_addr).await;
+    assert_listener_closed(jsonrpc_addr).await;
+    assert_listener_closed(lan_jsonrpc_addr).await;
+    let cleanup_count = state
+        .core
+        .debug_logs
+        .list()
+        .iter()
+        .filter(|entry| entry.module == "runtime.exit" && entry.message == "开始执行统一退出流程")
+        .count();
+    assert_eq!(cleanup_count, 1);
+}
+
+#[tokio::test]
+async fn reset_web_auth_requires_stopped_server_and_preserves_application_data() {
+    let runtime = listener_runtime(
+        "127.0.0.1:0".parse().expect("addr should parse"),
+        "127.0.0.1:0".parse().expect("addr should parse"),
+    );
+    std::fs::create_dir_all(&runtime.app_data_dir).expect("app data should create");
+    let database = connect_database(runtime.database_path.clone())
+        .await
+        .expect("database should connect");
+    let auth = AuthService::new(database.pool.clone());
+    auth.setup("test management password")
+        .await
+        .expect("auth should initialize");
+    upsert_download_task(&database.pool, &sample_task())
+        .await
+        .expect("task should save");
+    save_json_rpc_token(&database.pool, "preserved-rpc-token")
+        .await
+        .expect("token should save");
+    database.pool.close().await;
+
+    let accessible_contents = br#"{"paths":["/downloads"]}"#;
+    std::fs::write(&runtime.accessible_paths_path, accessible_contents)
+        .expect("accessible paths should write");
+    let aria2_session = runtime.app_data_dir.join("aria2").join("aria2.session");
+    std::fs::create_dir_all(aria2_session.parent().expect("parent should exist"))
+        .expect("aria2 dir should create");
+    std::fs::write(&aria2_session, b"session-record").expect("session should write");
+
+    let running_lock =
+        ServerProcessLock::acquire(&runtime.app_data_dir).expect("server lock should acquire");
+    let error = reset_web_auth_with_runtime(&runtime, || {
+        Ok("replacement management password".to_string())
+    })
+    .await
+    .expect_err("running server should block reset");
+    assert!(error.contains("正在运行"));
+    drop(running_lock);
+
+    reset_web_auth_with_runtime(&runtime, || {
+        Ok("replacement management password".to_string())
+    })
+    .await
+    .expect("stopped server should reset auth");
+    let database = connect_database(runtime.database_path.clone())
+        .await
+        .expect("database should reconnect");
+    let reset_state = AuthService::new(database.pool.clone())
+        .state()
+        .await
+        .expect("auth state should load");
+    assert!(!reset_state.setup_required);
+    let auth = AuthService::new(database.pool.clone());
+    assert!(auth
+        .verify_password("replacement management password")
+        .await
+        .is_ok());
+    assert!(auth
+        .verify_password("test management password")
+        .await
+        .is_err());
+    assert_eq!(reset_state.auth_version, 2);
+    assert_eq!(
+        load_json_rpc_token(&database.pool)
+            .await
+            .expect("token should load"),
+        "preserved-rpc-token"
+    );
+    assert_eq!(
+        list_download_tasks(&database.pool)
+            .await
+            .expect("tasks should load")
+            .len(),
+        1
+    );
+    assert_eq!(
+        std::fs::read(&runtime.accessible_paths_path).expect("paths should read"),
+        accessible_contents
+    );
+    assert_eq!(
+        std::fs::read(&aria2_session).expect("session should read"),
+        b"session-record"
+    );
+    database.pool.close().await;
+    let _ = std::fs::remove_dir_all(&runtime.app_data_dir);
+}
+
+#[tokio::test]
+async fn installation_validates_password_preserves_existing_credentials_and_requires_stopped_server(
+) {
+    let runtime = listener_runtime(
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    for (password, confirmation) in [
+        (None, None),
+        (Some("short"), Some("short")),
+        (Some("valid password"), Some("different password")),
+    ] {
+        assert!(
+            initialize_web_auth_with_runtime(&runtime, password, confirmation)
+                .await
+                .is_err()
+        );
+        let database = connect_database(runtime.database_path.clone())
+            .await
+            .unwrap();
+        assert!(
+            AuthService::new(database.pool.clone())
+                .state()
+                .await
+                .unwrap()
+                .setup_required
+        );
+        database.pool.close().await;
+    }
+    let running_lock = ServerProcessLock::acquire(&runtime.app_data_dir).unwrap();
+    assert!(initialize_web_auth_with_runtime(
+        &runtime,
+        Some("valid password"),
+        Some("valid password")
+    )
+    .await
+    .unwrap_err()
+    .contains("正在运行"));
+    drop(running_lock);
+    initialize_web_auth_with_runtime(&runtime, Some("valid password"), Some("valid password"))
+        .await
+        .unwrap();
+    initialize_web_auth_with_runtime(&runtime, None, None)
+        .await
+        .unwrap();
+    initialize_web_auth_with_runtime(
+        &runtime,
+        Some("replacement password"),
+        Some("replacement password"),
+    )
+    .await
+    .unwrap();
+    let database = connect_database(runtime.database_path.clone())
+        .await
+        .unwrap();
+    let auth = AuthService::new(database.pool.clone());
+    assert!(auth.verify_password("valid password").await.is_ok());
+    assert!(auth.verify_password("replacement password").await.is_err());
+    let before = auth.state().await.unwrap();
+    database.pool.close().await;
+    assert!(
+        reset_web_auth_with_runtime(&runtime, || Err("取消输入".to_string()))
+            .await
+            .is_err()
+    );
+    let database = connect_database(runtime.database_path.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        AuthService::new(database.pool.clone())
+            .state()
+            .await
+            .unwrap(),
+        before
+    );
+    database.pool.close().await;
+    std::fs::remove_dir_all(&runtime.app_data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn run_cli_rejects_unknown_commands() {
+    let error = run_cli(&["unknown".to_string()])
+        .await
+        .expect_err("unknown command should fail");
+    assert_eq!(
+        error,
+        "用法：motrix-fnos-server [initialize-web-auth|reset-web-auth|database-check|database-backup <output>|database-cleanup-history <before_timestamp_ms> [--apply]]"
+    );
+}
+
+fn sample_task() -> DownloadTask {
+    DownloadTask {
+        id: 7,
+        engine_generation: crate::config::aria2::EngineGeneration::NativeV2,
+        removed_from_status: None,
+        url: "https://example.com/archive.zip".to_string(),
+        source_type: crate::tasks::DownloadTaskSourceType::Url,
+        file_name: "archive.zip".to_string(),
+        save_dir: "/downloads".to_string(),
+        owned_task_dir: None,
+        category: "默认".to_string(),
+        gid: Some("gid-7".to_string()),
+        status: DownloadTaskStatus::Paused,
+        total_length: 1024,
+        completed_length: 512,
+        download_speed: 0,
+        error_code: None,
+        error_message: None,
+        file_path: Some("/downloads/archive.zip".to_string()),
+        use_proxy: false,
+        proxy_binding: crate::tasks::TaskProxyBinding::default(),
+        metadata_torrent_path: None,
+        files_deleted: false,
+        selected_file_indexes: Vec::new(),
+        confirmation_required: false,
+        files: Vec::new(),
+        created_at: 100,
+        updated_at: 101,
+    }
+}
+
+#[tokio::test]
+async fn unavailable_engines_restrict_management_without_loading_or_changing_old_tasks() {
+    use std::os::unix::fs::PermissionsExt;
+    for (index, script, executable) in [
+        (0, None, false),
+        (1, Some("#!/bin/sh\nprintf 'unknown engine\\n'\n"), true),
+        (2, Some("#!/bin/sh\nexit 1\n"), true),
+        (
+            3,
+            Some("#!/bin/sh\nprintf 'aria2 version 2.8.6\\n'\n"),
+            false,
+        ),
+        (4, Some("#!/bin/sh\nexec sleep 4\n"), true),
+        (
+            5,
+            Some("#!/bin/sh\nprintf 'aria2 version 2.5.5\\n'\n"),
+            true,
+        ),
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "motrix-engine-gate-{}-{}-{index}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("invalid-engine");
+        if let Some(script) = script {
+            std::fs::write(&binary, script).unwrap();
+            std::fs::set_permissions(
+                &binary,
+                std::fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+            )
+            .unwrap();
+        }
+        let runtime = ServerRuntimeConfig {
+            database_path: root.join(DATABASE_FILE_NAME),
+            accessible_paths_path: root.join(ACCESSIBLE_PATHS_FILE_NAME),
+            app_data_dir: root.clone(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            jsonrpc_addr: "127.0.0.1:0".parse().unwrap(),
+            lan_jsonrpc_addr: "127.0.0.1:0".parse().unwrap(),
+            aria2_path: Some(binary),
+            trusted_proxy_ips: Vec::new(),
+        };
+        let database = connect_database(runtime.database_path.clone())
+            .await
+            .unwrap();
+        let task = sample_task();
+        upsert_download_task(&database.pool, &task).await.unwrap();
+        save_json_rpc_token(&database.pool, "preserved-token")
+            .await
+            .unwrap();
+        let private = root.join("magnet-metadata/unreferenced/keep.bin");
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+        std::fs::write(&private, b"preserved content").unwrap();
+        database.pool.close().await;
+        let state = bootstrap_http_app_state(&runtime).await.unwrap();
+        assert_eq!(state.compatibility_snapshot().mode, "restricted");
+        assert_eq!(
+            state.compatibility_snapshot().reason_code.as_deref(),
+            Some(if index == 5 {
+                "engine_unsupported"
+            } else {
+                "engine_unknown"
+            })
+        );
+        assert_eq!(
+            state.compatibility_snapshot().engine_generation,
+            if index == 5 {
+                crate::config::aria2::EngineGeneration::LegacyV1
+            } else {
+                crate::config::aria2::EngineGeneration::Unknown
+            }
+        );
+        assert!(state.ensure_download_available().is_err());
+        assert!(state.core.download_tasks.list().unwrap().is_empty());
+        assert_eq!(
+            list_download_tasks(&state.core.database.pool)
+                .await
+                .unwrap(),
+            vec![task]
+        );
+        assert_eq!(state.json_rpc_token(), "preserved-token");
+        assert_eq!(std::fs::read(&private).unwrap(), b"preserved content");
+        assert!(state.aria2_runtime_snapshot().is_none());
+        state.core.database.pool.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+async fn reserve_local_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("temporary port should bind");
+    listener.local_addr().expect("local address should read")
+}
+
+async fn assert_listener_closed(addr: SocketAddr) {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "listener should reject new connections: {addr}"
+    );
+}
+
+fn listener_runtime(http_addr: SocketAddr, jsonrpc_addr: SocketAddr) -> ServerRuntimeConfig {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let app_data_dir = std::env::temp_dir().join(format!(
+        "motrix-fnos-listeners-{}-{}-{}",
+        std::process::id(),
+        now_ms(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    ServerRuntimeConfig {
+        database_path: app_data_dir.join(DATABASE_FILE_NAME),
+        accessible_paths_path: app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME),
+        app_data_dir: app_data_dir.clone(),
+        http_addr,
+        jsonrpc_addr,
+        lan_jsonrpc_addr: "127.0.0.1:0".parse().expect("addr should parse"),
+        aria2_path: Some(crate::test_support::native_version_only_engine(
+            &app_data_dir,
+        )),
+        trusted_proxy_ips: Vec::new(),
+    }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be valid")
+        .as_millis()
+}
+
+#[tokio::test]
+async fn native_bootstrap_ignores_damaged_legacy_rows_but_preserves_data_and_ids() {
+    use std::os::unix::fs::PermissionsExt;
+    for damaged in ["task", "operation"] {
+        let mut runtime = listener_runtime(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let database = connect_database(runtime.database_path.clone())
+            .await
+            .unwrap();
+        let mut legacy_task = sample_task();
+        legacy_task.engine_generation = crate::config::aria2::EngineGeneration::LegacyV1;
+        upsert_download_task(&database.pool, &legacy_task)
+            .await
+            .unwrap();
+        let operation = TaskOperation::with_id(
+            "legacy-damaged",
+            7,
+            TaskOperationType::Delete,
+            "file_cleanup_pending",
+            TaskOperationContext::default(),
+        );
+        begin_task_operation(&database.pool, &operation)
+            .await
+            .unwrap();
+        if damaged == "task" {
+            sqlx::query("UPDATE download_tasks SET selected_file_indexes = 'broken'")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO task_file_snapshots (task_id, file_index, path, name, length, completed_length, selected, checked_at) VALUES (7, -1, 'old', 'old', -1, -1, 1, 1)").execute(&database.pool).await.unwrap();
+        } else {
+            sqlx::query("UPDATE task_operations SET context_json = 'broken'")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+        save_json_rpc_token(&database.pool, "keep-rpc-token")
+            .await
+            .unwrap();
+        let auth = AuthService::new(database.pool.clone());
+        auth.setup("preserved management password").await.unwrap();
+        database.pool.close().await;
+        let binary = runtime.app_data_dir.join("version-only-engine");
+        std::fs::write(&binary, "#!/bin/sh\nprintf 'aria2 version 2.8.6\\n'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        runtime.aria2_path = Some(binary);
+        std::fs::write(runtime.app_data_dir.join("user-file"), b"keep payload").unwrap();
+        let state = bootstrap_http_app_state(&runtime).await.unwrap();
+        assert!(
+            state.ensure_download_available().is_ok(),
+            "legacy damage must not block native startup"
+        );
+        assert!(state.core.download_tasks.list().unwrap().is_empty());
+        assert_eq!(state.core.next_task_id.load(Ordering::SeqCst), 8);
+        assert_eq!(
+            load_json_rpc_token(&state.core.database.pool)
+                .await
+                .unwrap(),
+            "keep-rpc-token"
+        );
+        assert!(AuthService::new(state.core.database.pool.clone())
+            .verify_password("preserved management password")
+            .await
+            .is_ok());
+        assert_eq!(
+            std::fs::read(runtime.app_data_dir.join("user-file")).unwrap(),
+            b"keep payload"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_operations")
+            .fetch_one(&state.core.database.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            max_download_task_id(&state.core.database.pool)
+                .await
+                .unwrap(),
+            7
+        );
+        state.core.database.pool.close().await;
+        std::fs::remove_dir_all(runtime.app_data_dir).unwrap();
+    }
+}

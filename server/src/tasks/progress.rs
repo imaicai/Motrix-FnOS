@@ -1,0 +1,270 @@
+use crate::tasks::{
+    is_pending_magnet_metadata_task, DownloadTask, DownloadTaskFile, DownloadTaskStatus,
+    TaskMemoryState,
+};
+use std::path::{Path, PathBuf};
+
+use super::{current_timestamp_ms, Aria2TaskStatus};
+use crate::tasks::files::{bt_task_path_component, cleanup_aria2_control_file};
+
+pub(crate) fn apply_aria2_status_by_gid(
+    tasks: &TaskMemoryState,
+    gid: &str,
+    status: &Aria2TaskStatus,
+) -> Result<DownloadTask, String> {
+    tasks.with_tasks_mut(|guard| {
+        let task = guard
+            .iter_mut()
+            .find(|task| task.gid.as_deref() == Some(gid))
+            .ok_or_else(|| format!("下载任务不存在，GID {}", gid))?;
+        apply_aria2_status(task, status);
+        Ok(task.clone())
+    })?
+}
+
+pub(crate) fn apply_magnet_metadata_confirmation(
+    task: &mut DownloadTask,
+    status: &Aria2TaskStatus,
+) {
+    let display_name = status
+        .bittorrent
+        .as_ref()
+        .and_then(|bt| bt.info.as_ref())
+        .and_then(|info| info.name.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| task.file_name.clone());
+    let files = magnet_confirmation_files(status, &task.save_dir, &display_name);
+    let total_length = if files.is_empty() {
+        parse_aria2_u64(&status.total_length)
+    } else {
+        files.iter().map(|file| file.length).sum()
+    };
+
+    // metadata 与内容下载保持同一暂停 GID。
+    task.gid = status.gid.clone().or_else(|| task.gid.clone());
+    task.status = DownloadTaskStatus::Paused;
+    task.metadata_torrent_path = None;
+    task.selected_file_indexes.clear();
+    task.total_length = total_length;
+    task.completed_length = 0;
+    task.download_speed = 0;
+    task.error_code = None;
+    task.error_message = None;
+    task.confirmation_required = true;
+    task.files = files;
+    task.file_name = display_name;
+    task.file_path = None;
+    task.updated_at = current_timestamp_ms();
+}
+
+pub(crate) fn apply_aria2_status(task: &mut DownloadTask, status: &Aria2TaskStatus) {
+    update_aria2_status(task, status);
+    if task.status == DownloadTaskStatus::Complete {
+        cleanup_aria2_control_file(task);
+    }
+}
+
+pub(crate) fn update_aria2_status(task: &mut DownloadTask, status: &Aria2TaskStatus) {
+    if task.engine_generation == crate::config::aria2::EngineGeneration::NativeV2
+        && task.source_type == crate::tasks::DownloadTaskSourceType::Magnet
+        && is_magnet_metadata_awaiting(status)
+    {
+        apply_magnet_metadata_confirmation(task, status);
+        return;
+    }
+    let is_pending_magnet_metadata = is_pending_magnet_metadata_task(task);
+    let is_unconfirmed_magnet =
+        task.url.to_ascii_lowercase().starts_with("magnet:?") && task.confirmation_required;
+
+    task.status = map_aria2_status(&status.status);
+    task.total_length = parse_aria2_u64(&status.total_length);
+    task.completed_length = parse_aria2_u64(&status.completed_length);
+    task.download_speed = parse_aria2_u64(&status.download_speed);
+    task.error_code = normalize_aria2_error_code(status.error_code.as_deref());
+    task.error_message =
+        readable_aria2_error_message(task.error_code.as_deref(), status.error_message.as_deref());
+    if !is_pending_magnet_metadata && !is_unconfirmed_magnet {
+        if let Some(dir) = status.dir.clone().filter(|dir| !dir.is_empty()) {
+            task.save_dir = dir;
+        }
+    }
+    if let Some(name) = status
+        .bittorrent
+        .as_ref()
+        .and_then(|bt| bt.info.as_ref())
+        .and_then(|info| info.name.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        task.file_name = name.to_string();
+    }
+    if is_pending_magnet_metadata {
+        task.files.clear();
+        task.file_path = None;
+    } else if is_unconfirmed_magnet {
+        task.file_path = None;
+    } else {
+        let lower_url = task.url.to_ascii_lowercase();
+        if lower_url.starts_with("http://") || lower_url.starts_with("https://") {
+            if let Some(name) = status
+                .files
+                .as_ref()
+                .and_then(|files| files.first())
+                .and_then(|file| Path::new(&file.path).file_name())
+                .and_then(|name| name.to_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                task.file_name = name.to_string();
+            }
+        }
+        task.files = task_files(status);
+        task.selected_file_indexes = task
+            .files
+            .iter()
+            .filter(|file| file.selected)
+            .map(|file| file.index)
+            .collect();
+        task.file_path = status
+            .files
+            .as_ref()
+            .and_then(|files| files.first())
+            .map(|file| file.path.clone())
+            .filter(|path| !path.is_empty())
+            .or_else(|| {
+                Some(
+                    Path::new(&task.save_dir)
+                        .join(&task.file_name)
+                        .display()
+                        .to_string(),
+                )
+            });
+    }
+    task.updated_at = current_timestamp_ms();
+}
+
+fn is_magnet_metadata_awaiting(status: &Aria2TaskStatus) -> bool {
+    status
+        .bittorrent
+        .as_ref()
+        .and_then(|bittorrent| bittorrent.file_selection_state.as_deref())
+        == Some("awaiting")
+}
+
+pub(super) fn task_files(status: &Aria2TaskStatus) -> Vec<DownloadTaskFile> {
+    status
+        .files
+        .as_ref()
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| DownloadTaskFile {
+                    index: file.index,
+                    path: file.path.clone(),
+                    name: Path::new(&file.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&file.path)
+                        .to_string(),
+                    length: parse_aria2_u64(&file.length),
+                    completed_length: parse_aria2_u64(&file.completed_length),
+                    selected: file.selected != "false",
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn magnet_confirmation_files(
+    status: &Aria2TaskStatus,
+    base_save_dir: &str,
+    display_name: &str,
+) -> Vec<DownloadTaskFile> {
+    let preview_root = Path::new(base_save_dir).join(bt_task_path_component(display_name));
+    let metadata_dir = status
+        .dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+        .map(PathBuf::from);
+
+    status
+        .files
+        .as_ref()
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    let path = metadata_dir
+                        .as_deref()
+                        .and_then(|dir| Path::new(&file.path).strip_prefix(dir).ok())
+                        .map(|relative| preview_root.join(relative).display().to_string())
+                        .unwrap_or_else(|| file.path.clone());
+                    DownloadTaskFile {
+                        index: file.index,
+                        name: Path::new(&path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or(&path)
+                            .to_string(),
+                        path,
+                        length: parse_aria2_u64(&file.length),
+                        completed_length: parse_aria2_u64(&file.completed_length),
+                        selected: file.selected != "false",
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn is_aria2_status_error(status: &Aria2TaskStatus) -> bool {
+    status.status == "error"
+        || normalize_aria2_error_code(status.error_code.as_deref()).is_some()
+        || status
+            .error_message
+            .as_deref()
+            .map(|message| !message.trim().is_empty())
+            .unwrap_or(false)
+}
+
+pub(crate) fn normalize_aria2_error_code(error_code: Option<&str>) -> Option<String> {
+    error_code
+        .map(str::trim)
+        .filter(|code| !code.is_empty() && *code != "0")
+        .map(ToOwned::to_owned)
+}
+
+fn readable_aria2_error_message(
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> Option<String> {
+    let message = error_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+
+    match (error_code, message) {
+        (Some("16"), Some("Download aborted.")) => Some(
+            "Download aborted. 可能原因：Aria2 无法创建或写入目标文件，请检查下载目录权限和同名文件权限。"
+                .to_string(),
+        ),
+        (_, Some(message)) => Some(message.to_string()),
+        _ => None,
+    }
+}
+
+fn map_aria2_status(status: &str) -> DownloadTaskStatus {
+    match status {
+        "active" | "waiting" => DownloadTaskStatus::Active,
+        "paused" => DownloadTaskStatus::Paused,
+        "complete" => DownloadTaskStatus::Complete,
+        "error" => DownloadTaskStatus::Error,
+        "removed" => DownloadTaskStatus::Removed,
+        _ => DownloadTaskStatus::Pending,
+    }
+}
+
+pub(crate) fn parse_aria2_u64(value: &str) -> u64 {
+    value.parse::<u64>().unwrap_or_default()
+}

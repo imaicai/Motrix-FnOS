@@ -1,0 +1,746 @@
+use crate::tasks::{is_pending_magnet_metadata_task, DownloadTask, PreparedDownloadTask};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const RESTORE_METADATA_ROOT: &str = "task-metadata";
+const RESTORE_TORRENT_FILE: &str = "source.torrent";
+const REDOWNLOAD_BACKUP_PREFIX: &str = ".motrix-redownload-backup";
+
+pub(crate) struct StagedTaskFiles {
+    backup_dir: PathBuf,
+    entries: Vec<(PathBuf, PathBuf)>,
+    backup_dir_created: bool,
+    staged_count: usize,
+    recreated_directory: Option<PathBuf>,
+}
+
+impl StagedTaskFiles {
+    pub(crate) fn backup_dir(&self) -> &Path {
+        &self.backup_dir
+    }
+
+    pub(crate) fn commit(self) -> Result<(), String> {
+        fs::remove_dir_all(&self.backup_dir).map_err(|error| {
+            format!(
+                "清理重新下载暂存文件失败：{}（{}）",
+                self.backup_dir.display(),
+                error
+            )
+        })
+    }
+
+    pub(crate) fn restore(&mut self) -> Result<(), String> {
+        if !self.backup_dir_created {
+            return Ok(());
+        }
+        if self.staged_count == 0 {
+            remove_empty_backup_dir(&self.backup_dir)?;
+            self.backup_dir_created = false;
+            return Ok(());
+        }
+
+        let metadata = fs::symlink_metadata(&self.backup_dir).map_err(|error| {
+            format!(
+                "读取重新下载备份目录失败：{}（{}）；备份路径：{}",
+                self.backup_dir.display(),
+                error,
+                self.backup_dir.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "重新下载备份路径不是普通目录，已保留：{}",
+                self.backup_dir.display()
+            ));
+        }
+
+        while self.staged_count > 0 {
+            let (original, staged) = &self.entries[self.staged_count - 1];
+            if original.exists() {
+                let removable_empty_dir = self.recreated_directory.as_deref() == Some(original)
+                    && fs::symlink_metadata(original)
+                        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                        .unwrap_or(false)
+                    && fs::read_dir(original)
+                        .map(|mut entries| entries.next().is_none())
+                        .unwrap_or(false);
+                if !removable_empty_dir {
+                    return Err(format!(
+                        "恢复重新下载文件失败，目标路径已存在：{}；备份目录已保留：{}",
+                        original.display(),
+                        self.backup_dir.display()
+                    ));
+                }
+                fs::remove_dir(original).map_err(|error| {
+                    format!(
+                        "清理重新下载创建的空目录失败：{}（{}）；备份目录已保留：{}",
+                        original.display(),
+                        error,
+                        self.backup_dir.display()
+                    )
+                })?;
+                self.recreated_directory = None;
+            }
+            rename_no_replace(staged, original).map_err(|error| {
+                format!(
+                    "恢复重新下载文件失败：{} -> {}（{}）；备份目录已保留：{}",
+                    staged.display(),
+                    original.display(),
+                    error,
+                    self.backup_dir.display()
+                )
+            })?;
+            self.staged_count -= 1;
+        }
+        remove_empty_backup_dir(&self.backup_dir)?;
+        self.backup_dir_created = false;
+        Ok(())
+    }
+}
+
+pub(crate) fn cleanup_staged_task_file_path(task_id: u64, path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(format!(
+            "拒绝清理非绝对路径的任务暂存目录：{}",
+            path.display()
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!(
+            "拒绝清理包含相对路径组件的任务暂存目录：{}",
+            path.display()
+        ));
+    }
+
+    let expected_prefix = format!("{}-{}-", REDOWNLOAD_BACKUP_PREFIX, task_id);
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("任务暂存目录名称无效：{}", path.display()))?;
+    let suffix = name
+        .strip_prefix(&expected_prefix)
+        .filter(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+        .ok_or_else(|| {
+            format!(
+                "拒绝清理不属于任务 {} 的暂存目录：{}",
+                task_id,
+                path.display()
+            )
+        })?;
+    let _ = suffix;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "读取任务暂存目录失败：{}（{}）",
+                path.display(),
+                error
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "拒绝清理符号链接形式的任务暂存目录：{}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("任务暂存路径不是目录：{}", path.display()));
+    }
+
+    fs::remove_dir_all(path)
+        .map_err(|error| format!("清理任务暂存文件失败：{}（{}）", path.display(), error))
+}
+
+pub(crate) fn prepare_task_file_staging(
+    task: &DownloadTask,
+) -> Result<Option<StagedTaskFiles>, String> {
+    validate_task_files(task)?;
+    let lower_url = task.url.to_ascii_lowercase();
+    if lower_url.starts_with("torrent:") || lower_url.starts_with("magnet:?") {
+        let Some(task_dir) = resolve_bt_task_dir(task, lower_url.starts_with("magnet:?"))? else {
+            return Ok(None);
+        };
+        let parent = task_dir.parent().map(Path::to_path_buf);
+        return prepare_stage_paths(task.id, parent.as_deref(), vec![task_dir]);
+    }
+
+    let Some(file_path) = task
+        .file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    prepare_stage_paths(
+        task.id,
+        Path::new(file_path).parent(),
+        delete_file_candidates(Path::new(file_path)),
+    )
+}
+
+fn prepare_stage_paths(
+    task_id: u64,
+    parent: Option<&Path>,
+    paths: Vec<PathBuf>,
+) -> Result<Option<StagedTaskFiles>, String> {
+    let Some(parent) = parent else {
+        return Err("重新下载文件缺少父目录".to_string());
+    };
+    let existing = paths
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        return Ok(None);
+    }
+
+    let backup_dir = parent.join(format!(
+        "{}-{}-{}",
+        REDOWNLOAD_BACKUP_PREFIX,
+        task_id,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    let mut entries = Vec::with_capacity(existing.len());
+    for original in existing {
+        let Some(name) = original.file_name() else {
+            return Err(format!("重新下载文件路径无效：{}", original.display()));
+        };
+        let staged = backup_dir.join(name);
+        entries.push((original, staged));
+    }
+
+    Ok(Some(StagedTaskFiles {
+        backup_dir,
+        entries,
+        backup_dir_created: false,
+        staged_count: 0,
+        recreated_directory: None,
+    }))
+}
+
+impl StagedTaskFiles {
+    pub(crate) fn stage(&mut self) -> Result<(), String> {
+        fs::create_dir(&self.backup_dir).map_err(|error| {
+            format!(
+                "创建重新下载暂存目录失败：{}（{}）",
+                self.backup_dir.display(),
+                error
+            )
+        })?;
+        self.backup_dir_created = true;
+
+        for (original, staged) in &self.entries {
+            rename_no_replace(original, staged).map_err(|error| {
+                format!(
+                    "暂存重新下载文件失败：{} -> {}（{}）",
+                    original.display(),
+                    staged.display(),
+                    error
+                )
+            })?;
+            self.staged_count += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_replacement_directory(&mut self, path: &Path) -> Result<(), String> {
+        let Some((original, _)) = self.entries.first() else {
+            return Err(format!(
+                "无法确认重新创建目录属于本次暂存：{}",
+                path.display()
+            ));
+        };
+        if self.staged_count == 0 || !same_path_after_staging(original, path) {
+            return Err(format!(
+                "无法确认重新创建目录属于本次暂存：{}",
+                path.display()
+            ));
+        }
+        fs::create_dir(path).map_err(|error| {
+            format!("重建 BT 任务保存目录失败：{}（{}）", path.display(), error)
+        })?;
+        self.recreated_directory = Some(original.clone());
+        Ok(())
+    }
+}
+
+fn same_path_after_staging(original: &Path, replacement: &Path) -> bool {
+    original == replacement
+        || matches!(
+            (
+                original.parent().and_then(|path| path.canonicalize().ok()),
+                replacement
+                    .parent()
+                    .and_then(|path| path.canonicalize().ok()),
+            ),
+            (Some(original_parent), Some(replacement_parent))
+                if original_parent == replacement_parent
+                    && original.file_name() == replacement.file_name()
+        )
+}
+
+fn remove_empty_backup_dir(path: &Path) -> Result<(), String> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "清理重新下载恢复目录失败：{}（{}）",
+            path.display(),
+            error
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn path_exists(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    if path_exists(to)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "目标路径已存在",
+        ));
+    }
+    fs::rename(from, to)
+}
+
+pub fn delete_task_files(task: &DownloadTask) -> Result<(), String> {
+    delete_task_file(task)
+}
+
+pub fn validate_task_files(task: &DownloadTask) -> Result<(), String> {
+    let lower_url = task.url.to_ascii_lowercase();
+    if lower_url.starts_with("torrent:") || lower_url.starts_with("magnet:?") {
+        resolve_bt_task_dir(task, lower_url.starts_with("magnet:?"))?;
+        return Ok(());
+    }
+
+    validate_non_torrent_task_files(task)
+}
+
+pub(crate) fn delete_task_file(task: &DownloadTask) -> Result<(), String> {
+    let lower_url = task.url.to_ascii_lowercase();
+    if lower_url.starts_with("torrent:") || lower_url.starts_with("magnet:?") {
+        return delete_bt_task_dir(task, lower_url.starts_with("magnet:?"));
+    }
+
+    delete_non_torrent_task_files(task)
+}
+
+pub(crate) fn cleanup_empty_torrent_task_dir(task: &PreparedDownloadTask) {
+    let path = Path::new(&task.save_dir);
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+pub(crate) fn read_saved_torrent_metadata(task: &DownloadTask) -> Result<Vec<u8>, String> {
+    let torrent_path = find_saved_torrent_metadata_path(task)?;
+    fs::read(&torrent_path).map_err(|error| {
+        format!(
+            "读取磁链 metadata 种子失败：{}（{}）",
+            torrent_path.display(),
+            error
+        )
+    })
+}
+
+pub(crate) fn save_restore_torrent_metadata(
+    app_data_dir: &Path,
+    task_id: u64,
+    torrent_data: &[u8],
+) -> Result<PathBuf, String> {
+    if torrent_data.is_empty() {
+        return Err("种子 metadata 不能为空".to_string());
+    }
+    let metadata_dir = crate::state::ensure_private_directory(
+        app_data_dir,
+        Path::new(&format!("task-metadata/task-{task_id}")),
+    )?;
+    let path = metadata_dir.join(RESTORE_TORRENT_FILE);
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("创建任务私有种子失败，保留现有内容：{error}"))?;
+    file.write_all(torrent_data)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("保存任务私有种子失败：{error}"))?;
+    Ok(path)
+}
+
+pub(crate) fn remove_restore_metadata(app_data_dir: &Path, task_id: u64) {
+    let metadata_dir = restore_metadata_dir(app_data_dir, task_id);
+    if metadata_dir.is_dir() {
+        let _ = fs::remove_dir_all(metadata_dir);
+    }
+}
+
+fn restore_metadata_dir(app_data_dir: &Path, task_id: u64) -> PathBuf {
+    app_data_dir
+        .join(RESTORE_METADATA_ROOT)
+        .join(format!("task-{task_id}"))
+}
+
+fn find_saved_torrent_metadata_path(task: &DownloadTask) -> Result<PathBuf, String> {
+    if let Some(path) = task
+        .metadata_torrent_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    let task_dir = task_data_dir(task);
+    find_single_torrent_file(task_dir)
+}
+
+fn task_data_dir(task: &DownloadTask) -> &Path {
+    Path::new(task_download_dir(task))
+}
+
+pub(crate) fn task_download_dir(task: &DownloadTask) -> &str {
+    task.owned_task_dir
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(&task.save_dir)
+}
+
+pub(crate) fn find_single_torrent_file(task_dir: &Path) -> Result<PathBuf, String> {
+    if !task_dir.is_dir() {
+        return Err(format!("磁链 metadata 目录不存在：{}", task_dir.display()));
+    }
+
+    let mut candidates = fs::read_dir(task_dir)
+        .map_err(|error| {
+            format!(
+                "读取磁链 metadata 目录失败：{}（{}）",
+                task_dir.display(),
+                error
+            )
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| extension.eq_ignore_ascii_case("torrent"))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    match candidates.len() {
+        0 => Err(format!(
+            "磁链 metadata 已解析但未找到 .torrent 文件：{}",
+            task_dir.display()
+        )),
+        1 => Ok(candidates.remove(0)),
+        _ => Err(format!(
+            "磁链 metadata 目录存在多个 .torrent 文件，无法确定要使用哪一个：{}",
+            task_dir.display()
+        )),
+    }
+}
+
+pub(crate) fn safe_task_path_component(name: &str) -> String {
+    let sanitized = name
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .trim_matches([' ', '.'])
+        .chars()
+        .take(120)
+        .collect::<String>();
+
+    if sanitized.is_empty() {
+        "未命名种子任务".to_string()
+    } else {
+        sanitized
+    }
+}
+
+pub(crate) fn bt_task_path_component(name: &str) -> String {
+    let safe_name = safe_task_path_component(name);
+    Path::new(&safe_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&safe_name)
+        .to_string()
+}
+
+fn delete_bt_task_dir(task: &DownloadTask, allow_magnet_default_name: bool) -> Result<(), String> {
+    let Some(canonical_task_dir) = resolve_bt_task_dir(task, allow_magnet_default_name)? else {
+        return Ok(());
+    };
+    fs::remove_dir_all(&canonical_task_dir).map_err(|error| {
+        format!(
+            "删除 BT 任务目录失败：{}（{}）",
+            canonical_task_dir.display(),
+            error
+        )
+    })
+}
+
+fn resolve_bt_task_dir(
+    task: &DownloadTask,
+    allow_magnet_default_name: bool,
+) -> Result<Option<PathBuf>, String> {
+    let has_explicit_owned_dir = task
+        .owned_task_dir
+        .as_deref()
+        .map(|path| !path.trim().is_empty())
+        .unwrap_or(false);
+
+    // 磁力 metadata 尚未解析完成，或已经解析但用户尚未确认文件时，save_dir 仍是用户授权
+    // 根目录，不能把它当作 BT 任务目录删除。真实磁力任务创建后一定会记录 owned_task_dir。
+    if !has_explicit_owned_dir
+        && (is_pending_magnet_metadata_task(task)
+            || (task.url.to_ascii_lowercase().starts_with("magnet:?")
+                && task.confirmation_required))
+    {
+        return Ok(None);
+    }
+
+    // BT 删除只能作用于任务创建时记录的专属目录；符号链接、根目录和未迁移历史任务的
+    // 名称不匹配目录一律拒绝递归删除。新任务走 owned_task_dir，不再依赖 file_name。
+    let task_dir = task_data_dir(task);
+    let metadata = match fs::symlink_metadata(task_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "读取 BT 任务目录元数据失败：{}（{}）",
+                task_dir.display(),
+                error
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "拒绝删除符号链接形式的 BT 任务目录：{}",
+            task_dir.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("BT 任务专属路径不是文件夹：{}", task_dir.display()));
+    }
+
+    let canonical_task_dir = task_dir
+        .canonicalize()
+        .map_err(|error| format!("校验种子任务目录失败：{}（{}）", task_dir.display(), error))?;
+    let Some(parent) = canonical_task_dir.parent() else {
+        return Err("拒绝删除根目录".to_string());
+    };
+    if parent == canonical_task_dir {
+        return Err("拒绝删除根目录".to_string());
+    }
+
+    if !has_explicit_owned_dir {
+        let dir_name = canonical_task_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let task_name = bt_task_path_component(&task.file_name);
+        let magnet_default_name = bt_task_path_component("磁力链接任务");
+        // 未迁移的历史记录保留名称校验，避免把无法确认归属的路径递归删除。
+        let legacy_task_name = safe_task_path_component(&task.file_name);
+        let matches_task_name = matches_bt_task_dir_name(dir_name, &task_name)
+            || matches_bt_task_dir_name(dir_name, &legacy_task_name);
+        let matches_magnet_default_name = allow_magnet_default_name
+            && (dir_name == magnet_default_name
+                || dir_name.starts_with(&format!("{} (", magnet_default_name)));
+        if !matches_task_name && !matches_magnet_default_name {
+            return Err(format!(
+                "拒绝删除非 BT 任务专属目录：{}",
+                canonical_task_dir.display()
+            ));
+        }
+    }
+
+    Ok(Some(canonical_task_dir))
+}
+
+fn matches_bt_task_dir_name(dir_name: &str, task_name: &str) -> bool {
+    dir_name == task_name || dir_name.starts_with(&format!("{} (", task_name))
+}
+
+fn delete_non_torrent_task_files(task: &DownloadTask) -> Result<(), String> {
+    validate_non_torrent_task_files(task)?;
+
+    let Some(file_path) = task
+        .file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    for path in delete_file_candidates(Path::new(file_path)) {
+        if path.exists() {
+            delete_local_file(&path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_non_torrent_task_files(task: &DownloadTask) -> Result<(), String> {
+    let Some(file_path) = task
+        .file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    let candidates = delete_file_candidates(Path::new(file_path));
+    if !candidates.iter().any(|path| path.exists()) {
+        return Ok(());
+    }
+
+    // 单文件删除同样要在 canonicalize 后确认仍位于任务保存目录内，不能信任数据库中的原始路径文本。
+    let save_dir = Path::new(&task.save_dir)
+        .canonicalize()
+        .map_err(|error| format!("校验保存目录失败：{}（{}）", task.save_dir, error))?;
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        if !path.is_file() {
+            return Err(format!("当前仅支持删除单文件：{}", path.display()));
+        }
+
+        let file = path
+            .canonicalize()
+            .map_err(|error| format!("校验本地文件失败：{}（{}）", path.display(), error))?;
+        if !file.starts_with(&save_dir) {
+            return Err("拒绝删除保存目录外的文件".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn delete_local_file(file: &Path) -> Result<(), String> {
+    fs::remove_file(file)
+        .map_err(|error| format!("删除本地文件失败：{}（{}）", file.display(), error))
+}
+
+pub(crate) fn cleanup_aria2_control_file(task: &DownloadTask) {
+    let Some(file_path) = task
+        .file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return;
+    };
+
+    let control_file = PathBuf::from(format!("{}.aria2", file_path));
+    if !control_file.is_file() || !control_file_is_under_save_dir(&control_file, &task.save_dir) {
+        return;
+    }
+
+    let _ = fs::remove_file(control_file);
+}
+
+fn control_file_is_under_save_dir(control_file: &Path, save_dir: &str) -> bool {
+    let Ok(save_dir) = Path::new(save_dir).canonicalize() else {
+        return false;
+    };
+    let Some(parent) = control_file.parent() else {
+        return false;
+    };
+    parent
+        .canonicalize()
+        .map(|parent| parent.starts_with(save_dir))
+        .unwrap_or(false)
+}
+
+pub(crate) fn delete_file_candidates(path: &Path) -> Vec<PathBuf> {
+    vec![
+        path.to_path_buf(),
+        PathBuf::from(format!("{}.aria2", path.display())),
+    ]
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,31 @@
+{
+  "port-config": {
+    "protocol-file": "MotrixFNOS.sc"
+  },
+  "data-share": {
+    "shares": [
+      {
+        "name": "motrix_fnos",
+        "permission": {
+          "rw": [
+            "motrix_fnos"
+          ]
+        }
+      },
+      {
+        "name": "motrix_fnos/data",
+        "permission": {
+          "rw": [
+            "motrix_fnos"
+          ]
+        }
+      }
+    ]
+  },
+  "api-scope": [
+    "trim.file.sharedAccess",
+    "trim.file.path"
+  ],
+  "systemd-unit": {
+  }
+}

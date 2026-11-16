@@ -1,0 +1,2170 @@
+use super::*;
+use crate::api::error::ErrorResponse;
+use crate::app::bootstrap_http_app_state;
+use crate::config::aria2::Aria2BinarySource;
+use crate::runtime::ManagedAria2Process;
+use crate::tasks::{DownloadTask, DownloadTaskFile, DownloadTaskStatus};
+use axum::response::Response;
+use axum::routing::post;
+use axum::{
+    body::{to_bytes, Body},
+    http::{Request, StatusCode},
+};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::json;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use tower::ServiceExt;
+
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn task_operation_conflict_maps_to_conflict_response() {
+    let error = classify_task_error("该任务已有操作正在进行，请稍后重试".to_string());
+
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+}
+
+#[test]
+fn file_cleanup_pending_maps_to_conflict_response() {
+    let error = classify_task_error(
+        "任务文件仍在后台清理，暂不能执行此操作（file_cleanup_pending）".to_string(),
+    );
+
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+}
+
+#[test]
+fn restore_and_redownload_proxy_override_body_is_optional() {
+    assert!(parse_task_proxy_override_body(b"")
+        .expect("empty body should inherit task proxy")
+        .is_none());
+    assert_eq!(
+        parse_task_proxy_override_body(b"{}")
+            .expect("empty JSON object should inherit task proxy")
+            .expect("JSON body should be present")
+            .use_proxy,
+        None
+    );
+    assert_eq!(
+        parse_task_proxy_override_body(br#"{"useProxy":true}"#)
+            .expect("explicit override should parse")
+            .expect("JSON body should be present")
+            .use_proxy,
+        Some(true)
+    );
+    assert!(
+        parse_task_proxy_override_body(br#"{"useProxy":null}"#)
+            .expect("explicit null should parse")
+            .expect("JSON body should be present")
+            .proxy_field_present
+    );
+    assert_eq!(
+        parse_task_proxy_override_body(b"not-json")
+            .expect_err("invalid JSON should be rejected")
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn create_and_refresh_then_list_routes_work_with_ready_aria2() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-downloads").display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+
+    let created = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/tasks",
+                &json!({
+                    "url": "https://example.com/archive.zip",
+                    "fileName": "archive.zip",
+                    "saveDir": save_dir
+                }),
+            ))
+            .await
+            .expect("create response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(created.id, 1);
+    assert_eq!(created.gid.as_deref(), Some("gid-1"));
+    assert_eq!(created.status, DownloadTaskStatus::Pending);
+
+    let before_refresh = response_json::<Vec<DownloadTask>>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .body(Body::empty())
+                    .expect("list request should build"),
+            )
+            .await
+            .expect("list response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(before_refresh.len(), 1);
+    assert_eq!(before_refresh[0].status, DownloadTaskStatus::Pending);
+
+    crate::runtime::monitor_tasks_once(&state)
+        .await
+        .expect("background refresh should succeed");
+
+    let listed = response_json::<Vec<DownloadTask>>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("list response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, DownloadTaskStatus::Active);
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn create_route_starts_paused_magnet_metadata_resolution() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-magnet-downloads").display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+
+    let created = response_json::<DownloadTask>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "magnet:?xt=urn:btih:test",
+                "saveDir": save_dir.clone(),
+                "sourceType": "magnet",
+                "startMode": "paused"
+            }),
+        ))
+        .await
+        .expect("create response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(created.status, DownloadTaskStatus::Pending);
+    assert_eq!(created.file_name, "磁力链接任务");
+    assert_eq!(created.save_dir, save_dir);
+    assert!(created.file_path.is_none());
+    assert!(!PathBuf::from(&created.save_dir)
+        .join("磁力链接任务")
+        .exists());
+    assert!(state
+        .core
+        .app_data_dir
+        .join("magnet-metadata")
+        .join("task-1")
+        .is_dir());
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn confirm_task_files_route_validates_selection_and_starts_task() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-confirm-downloads").display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+
+    let created = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/tasks",
+                &json!({
+                    "url": "magnet:?xt=urn:btih:test",
+                    "sourceType": "magnet",
+                    "saveDir": save_dir
+                }),
+            ))
+            .await
+            .expect("create response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| {
+            let task = tasks
+                .iter_mut()
+                .find(|task| task.id == created.id)
+                .expect("created task should exist");
+            task.status = DownloadTaskStatus::Paused;
+            task.file_name = "archive.zip".to_string();
+            task.confirmation_required = true;
+            task.files = vec![DownloadTaskFile {
+                index: 1,
+                path: format!("{}/archive.zip/archive.zip", task.save_dir),
+                name: "archive.zip".to_string(),
+                length: 1024,
+                completed_length: 0,
+                selected: true,
+            }];
+        })
+        .expect("tasks should lock");
+
+    let error = response_json::<ErrorResponse>(
+        app.clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/tasks/1/confirm",
+                &json!({ "selectedFileIndexes": [] }),
+            ))
+            .await
+            .expect("empty confirm response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(error.code, "task_file_selection_invalid");
+    assert!(error.message.contains("至少选择一个文件"));
+
+    let confirmed = response_json::<DownloadTask>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks/1/confirm",
+            &json!({ "selectedFileIndexes": [1, 1] }),
+        ))
+        .await
+        .expect("confirm response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(confirmed.status, DownloadTaskStatus::Active);
+    assert_eq!(confirmed.gid.as_deref(), Some("gid-1"));
+    assert!(!confirmed.confirmation_required);
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn create_route_accepts_category_and_advanced_options() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-advanced-downloads").display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+
+    let created = response_json::<DownloadTask>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "https://example.com/archive.zip",
+                "fileName": "archive.zip",
+                "saveDir": save_dir,
+                "category": "电影",
+                "advancedOptions": {
+                    "connections": 8,
+                    "downloadLimitKb": 512,
+                    "proxy": "http://127.0.0.1:7890"
+                }
+            }),
+        ))
+        .await
+        .expect("create response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(created.category, "电影");
+    assert_eq!(created.gid.as_deref(), Some("gid-1"));
+    assert!(created.use_proxy);
+    let stored_override: Option<String> =
+        sqlx::query_scalar("SELECT proxy_url FROM task_proxy_overrides WHERE task_id = ?")
+            .bind(created.id as i64)
+            .fetch_optional(&state.core.database.pool)
+            .await
+            .expect("private proxy override should load");
+    assert_eq!(stored_override.as_deref(), Some("http://127.0.0.1:7890/"));
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn create_route_returns_structured_proxy_errors_without_side_effects() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-proxy-validation");
+    let save_dir_text = save_dir.display().to_string();
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir_text));
+
+    let conflict = response_json::<ErrorResponse>(
+        app.clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/tasks",
+                &json!({
+                    "url": "https://example.com/archive.zip",
+                    "saveDir": save_dir_text,
+                    "advancedOptions": {
+                        "useProxy": false,
+                        "proxy": "http://127.0.0.1:7890"
+                    }
+                }),
+            ))
+            .await
+            .expect("conflict response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(conflict.code, "proxy_conflict");
+
+    let missing = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "https://example.com/archive.zip",
+                "saveDir": save_dir_text,
+                "advancedOptions": { "useProxy": true }
+            }),
+        ))
+        .await
+        .expect("missing profile response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(missing.code, "proxy_not_configured");
+    assert!(!save_dir.exists());
+    assert!(state
+        .core
+        .download_tasks
+        .list()
+        .expect("tasks should list")
+        .is_empty());
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn create_route_checks_proxy_before_starting_aria2() {
+    let state = test_state().await;
+    let save_dir = temp_dir("task-proxy-preflight");
+    let save_dir_text = save_dir.display().to_string();
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir_text));
+    let app = test_router(state.clone());
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "https://example.com/archive.zip",
+                "saveDir": save_dir_text,
+                "advancedOptions": { "useProxy": true }
+            }),
+        ))
+        .await
+        .expect("proxy preflight response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    assert_eq!(error.code, "proxy_not_configured");
+    assert!(state.aria2_runtime_snapshot().is_none());
+    assert!(state
+        .aria2_process
+        .lock()
+        .expect("process lock should succeed")
+        .is_none());
+    assert!(!save_dir.exists());
+}
+
+#[tokio::test]
+async fn create_route_rejects_url_output_path_components() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-invalid-file-name");
+    let save_dir_text = save_dir.display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir_text));
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "https://example.com/archive.zip",
+                "fileName": "../escaped.bin",
+                "saveDir": save_dir_text
+            }),
+        ))
+        .await
+        .expect("invalid file name response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    assert_eq!(error.code, "invalid_file_name");
+    assert!(state
+        .core
+        .download_tasks
+        .list()
+        .expect("tasks should list")
+        .is_empty());
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn update_proxy_route_persists_without_starting_aria2() {
+    let state = test_state().await;
+    let task = sample_task(1, DownloadTaskStatus::Active);
+    crate::database::tasks::upsert_download_task(&state.core.database.pool, &task)
+        .await
+        .expect("task should persist");
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("task state should update");
+    crate::database::settings::replace_download_proxy_config(
+        &state.core.database.pool,
+        Some("http://127.0.0.1:7890/".to_string()),
+        None,
+        crate::database::settings::BtRuntimeApplyStatus::Deferred,
+        1,
+    )
+    .await
+    .expect("proxy profile should save");
+    let app = test_router(state.clone());
+
+    let updated = response_json::<DownloadTask>(
+        app.oneshot(json_request(
+            "PUT",
+            "/api/tasks/1/proxy",
+            &json!({ "enabled": true }),
+        ))
+        .await
+        .expect("proxy update response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert!(updated.use_proxy);
+    assert!(state.aria2_runtime_snapshot().is_none());
+    assert!(state
+        .aria2_process
+        .lock()
+        .expect("process lock should succeed")
+        .is_none());
+    let stored = crate::database::tasks::list_download_tasks(&state.core.database.pool)
+        .await
+        .expect("stored tasks should load");
+    assert!(stored[0].use_proxy);
+}
+
+#[tokio::test]
+async fn update_proxy_route_applies_active_task_and_maps_rpc_failure() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    state
+        .aria2_lifecycle
+        .set_phase(crate::runtime::Aria2LifecyclePhase::Ready)
+        .expect("lifecycle should be ready");
+    let task = sample_task(1, DownloadTaskStatus::Active);
+    crate::database::tasks::upsert_download_task(&state.core.database.pool, &task)
+        .await
+        .expect("task should persist");
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("task state should update");
+    crate::database::settings::replace_download_proxy_config(
+        &state.core.database.pool,
+        Some("http://127.0.0.1:7890/".to_string()),
+        None,
+        crate::database::settings::BtRuntimeApplyStatus::Deferred,
+        1,
+    )
+    .await
+    .expect("proxy profile should save");
+    let app = test_router(state.clone());
+
+    let updated = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(json_request(
+                "PUT",
+                "/api/tasks/1/proxy",
+                &json!({ "enabled": true }),
+            ))
+            .await
+            .expect("proxy enable response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(updated.use_proxy);
+
+    mock.state.fail_change_option.store(true, Ordering::SeqCst);
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "PUT",
+            "/api/tasks/1/proxy",
+            &json!({ "enabled": false }),
+        ))
+        .await
+        .expect("proxy disable failure response should succeed"),
+        StatusCode::BAD_GATEWAY,
+    )
+    .await;
+    assert_eq!(error.code, "proxy_apply_failed");
+    assert!(state.core.download_tasks.list().expect("tasks should list")[0].use_proxy);
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn update_proxy_route_rejects_runtime_transition() {
+    let state = test_state().await;
+    let task = sample_task(1, DownloadTaskStatus::Active);
+    crate::database::tasks::upsert_download_task(&state.core.database.pool, &task)
+        .await
+        .expect("task should persist");
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("task state should update");
+    crate::database::settings::replace_download_proxy_config(
+        &state.core.database.pool,
+        Some("http://127.0.0.1:7890/".to_string()),
+        None,
+        crate::database::settings::BtRuntimeApplyStatus::Deferred,
+        1,
+    )
+    .await
+    .expect("proxy profile should save");
+    state
+        .aria2_lifecycle
+        .set_phase(crate::runtime::Aria2LifecyclePhase::Starting)
+        .expect("lifecycle should start transitioning");
+    let app = test_router(state);
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "PUT",
+            "/api/tasks/1/proxy",
+            &json!({ "enabled": true }),
+        ))
+        .await
+        .expect("runtime transition response should succeed"),
+        StatusCode::CONFLICT,
+    )
+    .await;
+
+    assert_eq!(error.code, "runtime_transition");
+}
+
+#[tokio::test]
+async fn update_proxy_route_cleans_legacy_override_when_disabled() {
+    let state = test_state().await;
+    let mut task = sample_task(1, DownloadTaskStatus::Complete);
+    task.use_proxy = true;
+    task.proxy_binding = crate::tasks::TaskProxyBinding::override_url(
+        "socks5://legacy.example.com:1080".to_string(),
+    );
+    crate::database::tasks::upsert_download_task(&state.core.database.pool, &task)
+        .await
+        .expect("legacy proxy task should persist");
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("task state should update");
+    let app = test_router(state.clone());
+
+    let updated = response_json::<DownloadTask>(
+        app.oneshot(json_request(
+            "PUT",
+            "/api/tasks/1/proxy",
+            &json!({ "enabled": false }),
+        ))
+        .await
+        .expect("proxy disable response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert!(!updated.use_proxy);
+    let override_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_proxy_overrides WHERE task_id = 1")
+            .fetch_one(&state.core.database.pool)
+            .await
+            .expect("private proxy override count should load");
+    assert_eq!(override_count, 0);
+    let source: String = sqlx::query_scalar("SELECT proxy_source FROM download_tasks WHERE id = 1")
+        .fetch_one(&state.core.database.pool)
+        .await
+        .expect("proxy source should load");
+    assert_eq!(source, "profile");
+}
+
+#[tokio::test]
+async fn update_proxy_route_returns_structured_errors() {
+    let state = test_state().await;
+    let task = sample_task(1, DownloadTaskStatus::Active);
+    crate::database::tasks::upsert_download_task(&state.core.database.pool, &task)
+        .await
+        .expect("task should persist");
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("task state should update");
+    let app = test_router(state.clone());
+
+    let missing_profile = response_json::<ErrorResponse>(
+        app.clone()
+            .oneshot(json_request(
+                "PUT",
+                "/api/tasks/1/proxy",
+                &json!({ "enabled": true }),
+            ))
+            .await
+            .expect("missing proxy response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(missing_profile.code, "proxy_not_configured");
+
+    let missing_task = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "PUT",
+            "/api/tasks/999/proxy",
+            &json!({ "enabled": true }),
+        ))
+        .await
+        .expect("missing task response should succeed"),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(missing_task.code, "task_not_found");
+}
+
+#[tokio::test]
+async fn create_batch_route_returns_created_and_failed_items() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-batch-downloads").display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+    crate::database::settings::replace_download_proxy_config(
+        &state.core.database.pool,
+        Some("http://127.0.0.1:7890/".to_string()),
+        None,
+        crate::database::settings::BtRuntimeApplyStatus::Deferred,
+        1,
+    )
+    .await
+    .expect("proxy profile should save");
+
+    let result = response_json::<CreateBatchDownloadTasksResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks/batch",
+            &json!({
+                "urls": [
+                    "https://example.com/archive-a.zip",
+                    "ftp://example.com/archive-b.zip"
+                ],
+                "saveDir": save_dir,
+                "advancedOptions": { "useProxy": true }
+            }),
+        ))
+        .await
+        .expect("batch response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(result.created.len(), 1);
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(result.created[0].url, "https://example.com/archive-a.zip");
+    assert!(result.created[0].use_proxy);
+    assert_eq!(result.failed[0].input, "ftp://example.com/archive-b.zip");
+    assert_eq!(result.failed[0].code, "task_operation_failed");
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn create_batch_route_returns_bad_request_when_all_items_fail() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-batch-failed-downloads")
+        .display()
+        .to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+
+    let result = response_json::<CreateBatchDownloadTasksResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks/batch",
+            &json!({
+                "urls": ["ftp://example.com/archive.zip"],
+                "saveDir": save_dir
+            }),
+        ))
+        .await
+        .expect("batch response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    assert!(result.created.is_empty());
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(result.failed[0].input, "ftp://example.com/archive.zip");
+    assert_eq!(result.failed[0].code, "task_operation_failed");
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn create_batch_reports_proxy_preflight_failure_per_item_without_starting_aria2() {
+    let state = test_state().await;
+    let save_dir = temp_dir("task-batch-proxy-preflight");
+    let save_dir_text = save_dir.display().to_string();
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir_text));
+    let app = test_router(state.clone());
+
+    let result = response_json::<CreateBatchDownloadTasksResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks/batch",
+            &json!({
+                "urls": [
+                    "https://example.com/archive-a.zip",
+                    "https://example.com/archive-b.zip"
+                ],
+                "saveDir": save_dir_text,
+                "advancedOptions": { "useProxy": true }
+            }),
+        ))
+        .await
+        .expect("batch proxy preflight response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    assert!(result.created.is_empty());
+    assert_eq!(result.failed.len(), 2);
+    assert!(result
+        .failed
+        .iter()
+        .all(|failure| failure.message.contains("未配置下载代理")));
+    assert!(result
+        .failed
+        .iter()
+        .all(|failure| failure.code == "proxy_not_configured"));
+    assert!(state.aria2_runtime_snapshot().is_none());
+    assert!(!save_dir.exists());
+}
+
+#[tokio::test]
+async fn create_torrent_route_accepts_multipart_upload() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-torrent-downloads").display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+
+    let created = response_json::<DownloadTask>(
+        app.oneshot(multipart_torrent_request(
+            "/api/tasks/torrent",
+            "example.torrent",
+            b"torrent-bytes",
+            &json!({
+                "saveDir": save_dir,
+                "startMode": "paused"
+            }),
+        ))
+        .await
+        .expect("torrent response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(created.url, "torrent:example.torrent");
+    assert_eq!(created.file_name, "example");
+    assert_eq!(
+        PathBuf::from(&created.save_dir).file_name().unwrap(),
+        "example"
+    );
+    assert_eq!(created.status, DownloadTaskStatus::Paused);
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn pause_resume_and_delete_routes_update_task_state() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let app = test_router(state.clone());
+    let save_dir = temp_dir("task-downloads").display().to_string();
+    std::fs::create_dir_all(&save_dir).expect("authorized root should create");
+    write_accessible_paths(&state, std::slice::from_ref(&save_dir));
+
+    let _ = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "https://example.com/archive.zip",
+                "fileName": "archive.zip",
+                "saveDir": save_dir
+            }),
+        ))
+        .await
+        .expect("create response should succeed");
+
+    let paused = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/1/pause")
+                    .body(Body::empty())
+                    .expect("pause request should build"),
+            )
+            .await
+            .expect("pause response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(paused.status, DownloadTaskStatus::Paused);
+
+    let resumed = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/1/resume")
+                    .body(Body::empty())
+                    .expect("resume request should build"),
+            )
+            .await
+            .expect("resume response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(resumed.status, DownloadTaskStatus::Active);
+
+    let removed = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/tasks/1?deleteFiles=false")
+                    .body(Body::empty())
+                    .expect("delete request should build"),
+            )
+            .await
+            .expect("delete response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(removed.status, DownloadTaskStatus::Removed);
+
+    let listed = response_json::<Vec<DownloadTask>>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .body(Body::empty())
+                    .expect("list request should build"),
+            )
+            .await
+            .expect("list response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(listed.is_empty());
+
+    let removed_list = response_json::<Vec<DownloadTask>>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks?status=removed")
+                    .body(Body::empty())
+                    .expect("removed list request should build"),
+            )
+            .await
+            .expect("removed list response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(removed_list.len(), 1);
+    assert_eq!(removed_list[0].status, DownloadTaskStatus::Removed);
+
+    let restored = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/1/restore")
+                    .body(Body::empty())
+                    .expect("restore request should build"),
+            )
+            .await
+            .expect("restore response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(restored.status, DownloadTaskStatus::Paused);
+
+    let _ = response_json::<DownloadTask>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/tasks/1?deleteFiles=false")
+                    .body(Body::empty())
+                    .expect("second delete request should build"),
+            )
+            .await
+            .expect("second delete response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_status(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/tasks/1/permanent")
+                    .body(Body::empty())
+                    .expect("permanent delete request should build"),
+            )
+            .await
+            .expect("permanent delete response should succeed"),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let removed_list = response_json::<Vec<DownloadTask>>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks?status=removed")
+                .body(Body::empty())
+                .expect("removed list request should build"),
+        )
+        .await
+        .expect("removed list response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(removed_list.is_empty());
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn task_mutations_reject_when_runtime_is_exiting() {
+    let state = test_state().await;
+    state.core.shutdown.mark_exiting();
+    let app = test_router(state);
+
+    for request in [
+        json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "https://example.com/archive.zip",
+                "fileName": "archive.zip",
+                "saveDir": temp_dir("task-downloads")
+            }),
+        ),
+        Request::builder()
+            .method("POST")
+            .uri("/api/tasks/1/pause")
+            .body(Body::empty())
+            .expect("pause request should build"),
+        Request::builder()
+            .method("POST")
+            .uri("/api/tasks/1/resume")
+            .body(Body::empty())
+            .expect("resume request should build"),
+        Request::builder()
+            .method("POST")
+            .uri("/api/tasks/1/restore")
+            .body(Body::empty())
+            .expect("restore request should build"),
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/tasks/1?deleteFiles=false")
+            .body(Body::empty())
+            .expect("delete request should build"),
+    ] {
+        let error = response_json::<ErrorResponse>(
+            app.clone()
+                .oneshot(request)
+                .await
+                .expect("response should succeed"),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(error.code, "runtime_exiting");
+    }
+}
+
+#[tokio::test]
+async fn list_removed_tasks_does_not_require_ready_aria2() {
+    let state = test_state().await;
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| {
+            tasks.extend([
+                sample_task(1, DownloadTaskStatus::Active),
+                sample_task(2, DownloadTaskStatus::Removed),
+            ]);
+        })
+        .expect("tasks should lock");
+    let app = test_router(state);
+
+    let removed_list = response_json::<Vec<DownloadTask>>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks?status=removed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(removed_list.len(), 1);
+    assert_eq!(removed_list[0].id, 2);
+    assert_eq!(removed_list[0].status, DownloadTaskStatus::Removed);
+}
+
+#[tokio::test]
+async fn list_tasks_returns_memory_snapshot_when_aria2_is_stopped() {
+    let state = test_state().await;
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(sample_task(1, DownloadTaskStatus::Active)))
+        .expect("tasks should lock");
+    let app = test_router(state.clone());
+
+    let listed = response_json::<Vec<DownloadTask>>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, DownloadTaskStatus::Active);
+    assert!(state.aria2_runtime_snapshot().is_none());
+}
+
+#[tokio::test]
+async fn list_tasks_hides_internal_recovery_fields() {
+    let state = test_state().await;
+    let mut task = sample_task(1, DownloadTaskStatus::Paused);
+    task.proxy_binding = crate::tasks::TaskProxyBinding::override_url(
+        "http://private-user:private-pass@proxy.example:7890".to_string(),
+    );
+    task.metadata_torrent_path = Some("/private/metadata.torrent".to_string());
+    task.files_deleted = true;
+    task.selected_file_indexes = vec![1, 3];
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("tasks should lock");
+    let app = test_router(state);
+
+    let listed = response_json::<Vec<Value>>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+    let task = listed.first().expect("task should be returned");
+
+    assert!(task.get("proxyBinding").is_none());
+    assert!(task.get("metadataTorrentPath").is_none());
+    assert_eq!(task["filesDeleted"], true);
+    assert!(task.get("selectedFileIndexes").is_none());
+}
+
+#[tokio::test]
+async fn list_tasks_does_not_refresh_or_persist_when_aria2_is_ready() {
+    let mock = MockAria2Server::spawn().await;
+    let state = ready_state(&mock).await;
+    let persisted = sample_task(1, DownloadTaskStatus::Paused);
+    crate::database::tasks::upsert_download_task(&state.core.database.pool, &persisted)
+        .await
+        .expect("persisted task should save");
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(sample_task(1, DownloadTaskStatus::Active)))
+        .expect("tasks should lock");
+    let app = test_router(state.clone());
+    let request_count = mock.request_count();
+
+    let listed = response_json::<Vec<DownloadTask>>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, DownloadTaskStatus::Active);
+    assert_eq!(mock.request_count(), request_count);
+    assert!(state.aria2_runtime_snapshot().is_some());
+    assert!(state
+        .aria2_process
+        .lock()
+        .expect("process lock should succeed")
+        .is_some());
+
+    let stored = crate::database::tasks::list_download_tasks(&state.core.database.pool)
+        .await
+        .expect("stored tasks should load");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].status, DownloadTaskStatus::Paused);
+    assert_eq!(stored[0].updated_at, persisted.updated_at);
+
+    cleanup_state(&state);
+    mock.abort();
+}
+
+#[tokio::test]
+async fn list_tasks_rejects_unsupported_status_filter() {
+    let state = test_state().await;
+    let app = test_router(state);
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks?status=active")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    assert_eq!(error.code, "task_status_filter_invalid");
+}
+
+#[tokio::test]
+async fn old_delete_files_parameter_returns_migration_error_without_changing_task_or_file() {
+    let state = test_state().await;
+    let root = temp_dir("old-delete-files");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("payload.bin");
+    std::fs::write(&file, b"preserved").unwrap();
+    let mut task = sample_task(1, DownloadTaskStatus::Active);
+    task.file_path = Some(file.display().to_string());
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task.clone()))
+        .unwrap();
+    let response = test_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/tasks/1?deleteFiles=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let error = response_json::<ErrorResponse>(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(error.code, "task_delete_files_moved");
+    assert_eq!(state.core.download_tasks.list().unwrap(), vec![task]);
+    assert_eq!(std::fs::read(&file).unwrap(), b"preserved");
+    assert!(state.aria2_runtime_snapshot().is_none());
+    std::fs::remove_dir_all(root).unwrap();
+    cleanup_state(&state);
+}
+
+#[tokio::test]
+async fn permanent_delete_defaults_to_keeping_files_and_can_submit_background_cleanup() {
+    for delete_files in [false, true] {
+        let state = test_state().await;
+        let root = temp_dir("permanent-delete-files-api");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("payload.bin");
+        std::fs::write(&file, b"preserved").unwrap();
+        let mut task = sample_task(1, DownloadTaskStatus::Removed);
+        task.gid = None;
+        task.save_dir = root.display().to_string();
+        task.file_path = Some(file.display().to_string());
+        write_accessible_paths(&state, &[root.display().to_string()]);
+        crate::database::tasks::upsert_download_task(&state.core.database.pool, &task)
+            .await
+            .unwrap();
+        state
+            .core
+            .download_tasks
+            .with_tasks_mut(|tasks| tasks.push(task))
+            .unwrap();
+        assert!(state.try_start_file_cleanup_worker());
+        let app = test_router(state.clone());
+        let path = if delete_files {
+            "/api/tasks/1/permanent?deleteFiles=true"
+        } else {
+            "/api/tasks/1/permanent"
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if delete_files {
+            let pending = response_json::<PublicDownloadTask>(response, StatusCode::ACCEPTED).await;
+            assert_eq!(pending.cleanup_state, "pending");
+            assert!(!file.exists());
+            assert_eq!(state.core.download_tasks.list().unwrap().len(), 1);
+            for path in ["/api/tasks/1/permanent", "/api/tasks/1/restore"] {
+                let method = if path.ends_with("restore") {
+                    "POST"
+                } else {
+                    "DELETE"
+                };
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let error = response_json::<ErrorResponse>(response, StatusCode::CONFLICT).await;
+                assert_eq!(error.code, "file_cleanup_pending");
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/tasks?status=removed")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let tasks = response_json::<Vec<PublicDownloadTask>>(response, StatusCode::OK).await;
+            assert_eq!(tasks[0].cleanup_state, "pending");
+        } else {
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(std::fs::read(&file).unwrap(), b"preserved");
+            assert!(state.core.download_tasks.list().unwrap().is_empty());
+        }
+        assert!(state.aria2_runtime_snapshot().is_none());
+        state.finish_file_cleanup_worker();
+        std::fs::remove_dir_all(root).unwrap();
+        cleanup_state(&state);
+    }
+}
+
+#[tokio::test]
+async fn permanent_delete_unconfirmed_magnets_cleans_private_data_without_download_authorization() {
+    for awaiting_confirmation in [false, true] {
+        for delete_files in [false, true] {
+            let state = test_state().await;
+            let root = temp_dir("permanent-delete-magnet-private-only");
+            std::fs::create_dir_all(&root).unwrap();
+            let unrelated = root.join("unrelated.bin");
+            std::fs::write(&unrelated, b"keep user data").unwrap();
+            let metadata_dir = state.runtime.app_data_dir.join("magnet-metadata/task-1");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            std::fs::write(metadata_dir.join("metadata.torrent"), b"private metadata").unwrap();
+            let restore_path = crate::tasks::files::save_restore_torrent_metadata(
+                &state.runtime.app_data_dir,
+                1,
+                b"restore metadata",
+            )
+            .unwrap();
+            let mut task = sample_task(1, DownloadTaskStatus::Removed);
+            task.gid = None;
+            task.url = "magnet:?xt=urn:btih:test".to_string();
+            task.source_type = crate::tasks::DownloadTaskSourceType::Magnet;
+            task.save_dir = root.display().to_string();
+            task.file_path = None;
+            task.confirmation_required = awaiting_confirmation;
+            if awaiting_confirmation {
+                task.files = vec![DownloadTaskFile {
+                    index: 1,
+                    path: root.join("preview.bin").display().to_string(),
+                    name: "preview.bin".to_string(),
+                    length: 100,
+                    completed_length: 0,
+                    selected: true,
+                }];
+            }
+            write_accessible_paths(&state, &[]);
+            crate::database::tasks::upsert_download_task(&state.core.database.pool, &task)
+                .await
+                .unwrap();
+            state
+                .core
+                .download_tasks
+                .with_tasks_mut(|tasks| tasks.push(task))
+                .unwrap();
+
+            let response = test_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/tasks/1/permanent?deleteFiles={delete_files}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(state.core.download_tasks.list().unwrap().is_empty());
+            assert!(
+                crate::database::tasks::list_download_tasks(&state.core.database.pool)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!metadata_dir.exists());
+            assert!(!restore_path.exists());
+            assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep user data");
+            assert!(state.aria2_runtime_snapshot().is_none());
+            std::fs::remove_dir_all(root).unwrap();
+            cleanup_state(&state);
+        }
+    }
+}
+
+#[tokio::test]
+async fn permanent_delete_confirmed_magnet_requires_authorization_even_at_zero_progress() {
+    let state = test_state().await;
+    let root = temp_dir("permanent-delete-confirmed-magnet");
+    let owned = root.join("owned");
+    std::fs::create_dir_all(&owned).unwrap();
+    let payload = owned.join("payload.bin");
+    std::fs::write(&payload, b"preallocated content").unwrap();
+    let mut task = sample_task(1, DownloadTaskStatus::Removed);
+    task.url = "magnet:?xt=urn:btih:test".to_string();
+    task.source_type = crate::tasks::DownloadTaskSourceType::Magnet;
+    task.gid = None;
+    task.save_dir = root.display().to_string();
+    task.owned_task_dir = Some(owned.display().to_string());
+    task.file_path = None;
+    task.completed_length = 0;
+    write_accessible_paths(&state, &[]);
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task.clone()))
+        .unwrap();
+
+    let response = test_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/tasks/1/permanent?deleteFiles=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let error = response_json::<ErrorResponse>(response, StatusCode::FORBIDDEN).await;
+    assert_eq!(error.code, "save_dir_not_authorized");
+    assert_eq!(state.core.download_tasks.list().unwrap(), vec![task]);
+    assert_eq!(std::fs::read(&payload).unwrap(), b"preallocated content");
+    assert!(state.aria2_runtime_snapshot().is_none());
+    std::fs::remove_dir_all(root).unwrap();
+    cleanup_state(&state);
+}
+
+#[tokio::test]
+async fn permanent_delete_rejects_non_removed_task() {
+    let state = test_state().await;
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(sample_task(1, DownloadTaskStatus::Active)))
+        .expect("tasks should lock");
+    let app = test_router(state);
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/tasks/1/permanent")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    assert_eq!(error.code, "task_operation_failed");
+}
+
+#[tokio::test]
+async fn create_route_rejects_unauthorized_save_dir() {
+    let state = test_state().await;
+    write_accessible_paths(&state, &["/vol1/authorized".to_string()]);
+    let app = test_router(state);
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks",
+            &json!({
+                "url": "https://example.com/archive.zip",
+                "fileName": "archive.zip",
+                "saveDir": "/vol1/other"
+            }),
+        ))
+        .await
+        .expect("response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    assert_eq!(error.code, "save_dir_not_authorized");
+}
+
+#[tokio::test]
+async fn file_context_returns_safe_url_targets_and_display_paths() {
+    let state = test_state().await;
+    let root = temp_dir("task-file-context-url");
+    std::fs::create_dir_all(&root).expect("root should exist");
+    let file = root.join("archive.zip");
+    std::fs::write(&file, b"data").expect("file should write");
+    write_accessible_paths(&state, &[root.display().to_string()]);
+    let mut task = sample_task(7, DownloadTaskStatus::Complete);
+    task.save_dir = root.display().to_string();
+    task.file_path = Some(file.display().to_string());
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("tasks should update");
+    let app = test_router(state);
+
+    let context = response_json::<TaskFileContextResponse>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks/7/file-context?language=en-US")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(context.save_dir.path, root.display().to_string());
+    assert_eq!(context.save_dir.display_path, root.display().to_string());
+    assert_eq!(
+        context.file_path.expect("file path should exist").path,
+        file.display().to_string()
+    );
+    assert_eq!(
+        context.actions.availability,
+        crate::tasks::TaskFileAvailability::Available
+    );
+    assert_eq!(
+        context.actions.open_file_path,
+        Some(file.display().to_string())
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn file_context_never_exposes_targets_after_authorization_is_revoked() {
+    let state = test_state().await;
+    let root = temp_dir("task-file-context-revoked");
+    std::fs::create_dir_all(&root).expect("root should exist");
+    let file = root.join("archive.zip");
+    std::fs::write(&file, b"data").expect("file should write");
+    write_accessible_paths(&state, &[]);
+    let mut task = sample_task(8, DownloadTaskStatus::Complete);
+    task.save_dir = root.display().to_string();
+    task.file_path = Some(file.display().to_string());
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("tasks should update");
+    let app = test_router(state);
+
+    let context = response_json::<TaskFileContextResponse>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks/8/file-context")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(
+        context.actions.availability,
+        crate::tasks::TaskFileAvailability::PathUnauthorized
+    );
+    assert!(context.actions.file_manager_path.is_none());
+    assert!(context.actions.open_file_path.is_none());
+    assert!(context.actions.detail_paths.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn file_context_rejects_invalid_language_and_unknown_task() {
+    let state = test_state().await;
+    let app = test_router(state);
+
+    let invalid_language = response_json::<ErrorResponse>(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks/1/file-context?language=fr-FR")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should succeed"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(invalid_language.code, "display_language_invalid");
+
+    let missing = response_json::<ErrorResponse>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks/999/file-context")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(missing.code, "task_not_found");
+}
+
+#[tokio::test]
+async fn file_context_fails_closed_when_authorization_snapshot_is_invalid() {
+    let state = test_state().await;
+    std::fs::write(&state.runtime.accessible_paths_path, "not-json")
+        .expect("invalid snapshot should write");
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(sample_task(9, DownloadTaskStatus::Complete)))
+        .expect("tasks should update");
+    let app = test_router(state);
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/tasks/9/file-context")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should succeed"),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+
+    assert_eq!(error.code, "task_file_context_failed");
+}
+
+#[tokio::test]
+async fn resume_route_rejects_revoked_task_before_starting_aria2() {
+    let state = test_state().await;
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(sample_task(9, DownloadTaskStatus::Paused)))
+        .expect("task should be added");
+    write_accessible_paths(&state, &[]);
+    let app = test_router(state.clone());
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tasks/9/resume")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("response should complete"),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+
+    assert_eq!(error.code, "save_dir_not_authorized");
+    assert!(state.aria2_runtime_snapshot().is_none());
+}
+
+#[tokio::test]
+async fn confirm_route_rejects_revoked_magnet_before_starting_aria2() {
+    let state = test_state().await;
+    let mut task = sample_task(9, DownloadTaskStatus::Pending);
+    task.url = "magnet:?xt=urn:btih:test".to_string();
+    task.source_type = DownloadTaskSourceType::Magnet;
+    task.confirmation_required = true;
+    state
+        .core
+        .download_tasks
+        .with_tasks_mut(|tasks| tasks.push(task))
+        .expect("task should be added");
+    write_accessible_paths(&state, &[]);
+    let app = test_router(state.clone());
+
+    let error = response_json::<ErrorResponse>(
+        app.oneshot(json_request(
+            "POST",
+            "/api/tasks/9/confirm",
+            &json!({ "selectedFileIndexes": [1] }),
+        ))
+        .await
+        .expect("response should complete"),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+
+    assert_eq!(error.code, "save_dir_not_authorized");
+    assert!(state.aria2_runtime_snapshot().is_none());
+}
+
+fn test_router(state: Arc<HttpAppState>) -> Router {
+    Router::new()
+        .nest("/api", routes().merge(torrent_routes()))
+        .with_state(state)
+}
+
+async fn test_state() -> Arc<HttpAppState> {
+    let app_data_dir = temp_dir("tasks-api");
+    let runtime = crate::test_support::test_runtime(&app_data_dir);
+
+    bootstrap_http_app_state(&runtime)
+        .await
+        .expect("state should bootstrap")
+}
+
+fn write_accessible_paths(state: &Arc<HttpAppState>, paths: &[String]) {
+    std::fs::write(
+        &state.runtime.accessible_paths_path,
+        serde_json::to_vec(&json!({ "paths": paths })).expect("paths should serialize"),
+    )
+    .expect("accessible paths should write");
+}
+
+async fn ready_state(mock: &MockAria2Server) -> Arc<HttpAppState> {
+    let state = test_state().await;
+    let child = spawn_sleep_child();
+    let child_pid = child.id();
+    let config = crate::aria2::runtime_config(
+        &state.base_aria2_config,
+        mock.addr.port(),
+        "secret".to_string(),
+    );
+    state
+        .set_aria2_runtime(state.build_aria2_runtime_info(
+            child_pid,
+            &config,
+            Aria2BinarySource::ExternalPath,
+            vec!["--mock".to_string()],
+        ))
+        .expect("runtime should persist");
+    *state
+        .aria2_process
+        .lock()
+        .expect("process lock should succeed") = Some(ManagedAria2Process::new(
+        child,
+        Aria2BinarySource::ExternalPath,
+    ));
+    state
+        .aria2_lifecycle
+        .set_phase(crate::runtime::Aria2LifecyclePhase::Ready)
+        .expect("ready fixture should be ready");
+
+    state
+}
+
+fn cleanup_state(state: &Arc<HttpAppState>) {
+    let _ = crate::runtime::stop_process(&state.aria2_process, &state.core.debug_logs);
+    state
+        .clear_aria2_runtime()
+        .expect("runtime record should clear");
+}
+
+async fn response_json<T: DeserializeOwned>(response: Response, expected_status: StatusCode) -> T {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    assert_eq!(
+        status,
+        expected_status,
+        "unexpected response body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    serde_json::from_slice(&body).expect("response json should deserialize")
+}
+
+async fn assert_status(response: Response, expected_status: StatusCode) {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    assert_eq!(
+        status,
+        expected_status,
+        "unexpected response body: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+fn json_request<T: Serialize>(method: &str, uri: &str, payload: &T) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(payload).expect("payload should serialize"),
+        ))
+        .expect("request should build")
+}
+
+fn multipart_torrent_request(
+    uri: &str,
+    file_name: &str,
+    data: &[u8],
+    request_payload: &Value,
+) -> Request<Body> {
+    let boundary = "motrix-fnos-test-boundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"torrent\"; filename=\"{file_name}\"\r\nContent-Type: application/x-bittorrent\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(data);
+    body.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--{boundary}--\r\n",
+            serde_json::to_string(request_payload).expect("request payload should serialize")
+        )
+        .as_bytes(),
+    );
+
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .expect("multipart request should build")
+}
+
+fn sample_task(id: u64, status: DownloadTaskStatus) -> DownloadTask {
+    DownloadTask {
+        id,
+        engine_generation: crate::config::aria2::EngineGeneration::NativeV2,
+        removed_from_status: None,
+        url: format!("https://example.com/archive-{id}.zip"),
+        source_type: crate::tasks::DownloadTaskSourceType::Url,
+        file_name: format!("archive-{id}.zip"),
+        save_dir: "/downloads".to_string(),
+        owned_task_dir: None,
+        category: "默认".to_string(),
+        gid: Some(format!("gid-{id}")),
+        status,
+        total_length: 1024,
+        completed_length: 256,
+        download_speed: 0,
+        error_code: None,
+        error_message: None,
+        file_path: Some(format!("/downloads/archive-{id}.zip")),
+        use_proxy: false,
+        proxy_binding: crate::tasks::TaskProxyBinding::default(),
+        metadata_torrent_path: None,
+        files_deleted: false,
+        selected_file_indexes: Vec::new(),
+        confirmation_required: false,
+        files: Vec::new(),
+        created_at: id,
+        updated_at: id,
+    }
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        "motrix-fnos-{}-{}-{}-{}",
+        label,
+        std::process::id(),
+        counter,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos()
+    ))
+}
+
+#[cfg(unix)]
+fn spawn_sleep_child() -> std::process::Child {
+    std::process::Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .spawn()
+        .expect("sleep child should spawn")
+}
+
+#[cfg(windows)]
+fn spawn_sleep_child() -> std::process::Child {
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+        .spawn()
+        .expect("sleep child should spawn")
+}
+
+struct MockAria2Server {
+    addr: SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+    state: Arc<MockAria2State>,
+}
+
+impl MockAria2Server {
+    async fn spawn() -> Self {
+        let state = Arc::new(MockAria2State::default());
+        let app = Router::new()
+            .route("/jsonrpc", post(mock_aria2_rpc))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should serve");
+        });
+
+        Self {
+            addr,
+            handle,
+            state,
+        }
+    }
+
+    fn request_count(&self) -> u64 {
+        self.state.request_count.load(Ordering::SeqCst)
+    }
+
+    fn abort(self) {
+        self.handle.abort();
+    }
+}
+
+#[derive(Default)]
+struct MockAria2State {
+    next_gid: AtomicU64,
+    request_count: AtomicU64,
+    fail_change_option: AtomicBool,
+    tasks: Mutex<HashMap<String, MockTask>>,
+}
+
+#[derive(Clone)]
+struct MockTask {
+    status: String,
+    dir: String,
+    file_name: String,
+    file_selection_state: Option<String>,
+}
+
+async fn mock_aria2_rpc(
+    State(state): State<Arc<MockAria2State>>,
+    Json(payload): Json<Value>,
+) -> Json<Value> {
+    state.request_count.fetch_add(1, Ordering::SeqCst);
+    let method = payload
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = payload
+        .get("params")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Json(match method {
+        "aria2.getVersion" => json!({
+            "result": {
+                "version": "2.8.6"
+            }
+        }),
+        "aria2.saveSession" | "aria2.changeGlobalOption" => json!({ "result": "OK" }),
+        "aria2.getGlobalOption" => json!({"result":{"bt-proxy":""}}),
+        "aria2.addUri" => {
+            let options_index = if first_param_is_token(&params) { 2 } else { 1 };
+            let options = params
+                .get(options_index)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let dir = options
+                .get("dir")
+                .and_then(Value::as_str)
+                .unwrap_or("/downloads")
+                .to_string();
+            let file_name = options
+                .get("out")
+                .and_then(Value::as_str)
+                .unwrap_or("archive.zip")
+                .to_string();
+            let gid = format!("gid-{}", state.next_gid.fetch_add(1, Ordering::SeqCst) + 1);
+            let is_magnet = params
+                .iter()
+                .find_map(Value::as_array)
+                .and_then(|urls| urls.first())
+                .and_then(Value::as_str)
+                .is_some_and(|url| url.starts_with("magnet:"));
+            state.tasks.lock().expect("tasks should lock").insert(
+                gid.clone(),
+                MockTask {
+                    status: if is_magnet { "paused" } else { "active" }.to_string(),
+                    dir,
+                    file_name,
+                    file_selection_state: is_magnet.then(|| "awaiting".to_string()),
+                },
+            );
+            json!({ "result": gid })
+        }
+        "aria2.addTorrent" => {
+            let options_index = if first_param_is_token(&params) { 3 } else { 2 };
+            let options = params
+                .get(options_index)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let dir = options
+                .get("dir")
+                .and_then(Value::as_str)
+                .unwrap_or("/downloads")
+                .to_string();
+            let gid = format!("gid-{}", state.next_gid.fetch_add(1, Ordering::SeqCst) + 1);
+            state.tasks.lock().expect("tasks should lock").insert(
+                gid.clone(),
+                MockTask {
+                    status: "active".to_string(),
+                    dir,
+                    file_name: "example".to_string(),
+                    file_selection_state: Some("ready".to_string()),
+                },
+            );
+            json!({ "result": gid })
+        }
+        "aria2.pause" => {
+            let gid = gid_param(&params);
+            if let Some(task) = state.tasks.lock().expect("tasks should lock").get_mut(&gid) {
+                task.status = "paused".to_string();
+            }
+            json!({ "result": gid })
+        }
+        "aria2.unpause" => {
+            let gid = gid_param(&params);
+            if let Some(task) = state.tasks.lock().expect("tasks should lock").get_mut(&gid) {
+                task.status = "active".to_string();
+            }
+            json!({ "result": gid })
+        }
+        "aria2.changeOption" => {
+            let gid = gid_param(&params);
+            if state.fail_change_option.load(Ordering::SeqCst) {
+                json!({ "error": { "code": 1, "message": "cannot change option" } })
+            } else {
+                let options = params.last().and_then(Value::as_object).unwrap();
+                if let Some(task) = state.tasks.lock().unwrap().get_mut(&gid) {
+                    if let Some(dir) = options.get("dir").and_then(Value::as_str) {
+                        task.dir = dir.to_string();
+                    }
+                    if options.contains_key("select-file") {
+                        task.file_selection_state = Some("ready".to_string());
+                    }
+                }
+                json!({ "result": gid })
+            }
+        }
+        "aria2.getOption" => {
+            let gid = gid_param(&params);
+            let task = state
+                .tasks
+                .lock()
+                .expect("tasks should lock")
+                .get(&gid)
+                .cloned();
+            json!({
+                "result": {
+                    "all-proxy": "",
+                    "dir": task.as_ref().map(|task| task.dir.as_str()).unwrap_or("/downloads"),
+                    "out": task.as_ref().map(|task| task.file_name.as_str()).unwrap_or("archive.zip")
+                }
+            })
+        }
+        "aria2.remove" | "aria2.removeDownloadResult" => {
+            let gid = gid_param(&params);
+            state.tasks.lock().expect("tasks should lock").remove(&gid);
+            json!({ "result": gid })
+        }
+        "aria2.tellStatus" => {
+            let gid = gid_param(&params);
+            if let Some(task) = state
+                .tasks
+                .lock()
+                .expect("tasks should lock")
+                .get(&gid)
+                .cloned()
+            {
+                json!({
+                    "result": {
+                        "gid": gid,
+                        "status": task.status,
+                        "totalLength": "1024",
+                        "completedLength": "256",
+                        "downloadSpeed": "128",
+                        "dir": task.dir,
+                        "bittorrent": task.file_selection_state.as_ref().map(|selection| json!({"fileSelectionState":selection,"info":{"name":task.file_name}})),
+                        "files": [
+                            {
+                                "index": 1,
+                                "path": format!("{}/{}", task.dir, task.file_name),
+                                "length": "1024",
+                                "completedLength": "256",
+                                "selected": "true",
+                                "uris": []
+                            }
+                        ]
+                    }
+                })
+            } else {
+                json!({
+                    "error": {
+                        "message": format!("GID {gid} is not found")
+                    }
+                })
+            }
+        }
+        _ => json!({
+            "error": {
+                "message": format!("unsupported method: {}", method)
+            }
+        }),
+    })
+}
+
+fn first_param_is_token(params: &[Value]) -> bool {
+    params
+        .first()
+        .and_then(Value::as_str)
+        .map(|value| value.starts_with("token:"))
+        .unwrap_or(false)
+}
+
+fn gid_param(params: &[Value]) -> String {
+    let index = if first_param_is_token(params) { 1 } else { 0 };
+    params
+        .get(index)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}

@@ -1,0 +1,1043 @@
+# 前后端 HTTP / SSE / JSON-RPC API 契约（开发者参考）
+
+> **适用读者：** 前后端开发者和第三方客户端开发者。本文保留完整的接口参数、响应示例、错误处理、兼容规则及相关实现约束，供开发和联调时按需查阅。普通使用请看 [安装与使用](../README.md#安装与使用)，排障、远程接入和备份请看 [维护手册](maintenance.md)。
+
+> 本文定义 Rust server、Vue Web UI 与外部 JSON-RPC 调用方之间的接口。项目结构见 [架构](architecture.md)，未完成事项见 [开发计划](future-development-plan.md)，交互见 [UI 规范](design/DESIGN.md)，开发、打包与排障见 [维护手册](maintenance.md)。
+
+## 查阅目录
+
+- [运行时与监听器约定](#1-运行时约定)
+- [前端消费约定](#2-前端消费约定)
+- [通用错误响应](#3-错误响应)
+- [HTTP API](#4-http-api)
+  - [Web 管理鉴权](#41-web-管理鉴权)
+  - [应用信息与兼容状态](#42-应用信息)
+  - [Aria2 引擎控制](#43-aria2)
+  - [任务](#44-任务)
+  - [设置](#45-设置)
+  - [调试日志](#46-调试日志)
+  - [Aria2 详细日志模式](#47-aria2-详细日志模式)
+  - [日志占用、存储占用、清理与诊断包](#48-日志占用清理与诊断包)
+  - [授权目录](#49-存储目录)
+- [SSE 事件流](#5-sse-事件流)
+- [JSON-RPC 兼容入口](#6-json-rpc-兼容入口)
+
+## 1. 运行时约定
+
+| 环境变量 | 作用 | 默认值 |
+| --- | --- | --- |
+| `MOTRIX_FNOS_APP_DATA_DIR` | server 数据目录 | 用户本地数据目录下的 `motrix-fnos` |
+| `MOTRIX_FNOS_HTTP_ADDR` | 管理 IPv4 监听地址；IPv4 通配地址会额外监听同端口 IPv6 | `0.0.0.0:17080` |
+| `MOTRIX_FNOS_JSONRPC_ADDR` | JSON-RPC 专用监听地址 | `127.0.0.1:17081` |
+| `MOTRIX_FNOS_LAN_JSONRPC_ADDR` | 局域网 JSON-RPC 监听地址 | `0.0.0.0:17082` |
+| `MOTRIX_FNOS_ARIA2_PATH` | Aria2 可执行文件路径 | 打包路径优先，仓库调试路径兜底 |
+| `MOTRIX_FNOS_ACCESSIBLE_PATHS_FILE` | fnOS 已授权目录快照文件 | `MOTRIX_FNOS_APP_DATA_DIR/accessible-paths.json` |
+| `TRIM_API_TOKEN` | fnOS 为已声明 Scope 的 FPK 进程注入的开放 API Token，只按请求读取 | 无；缺失时保留最后一次官方 API 快照 |
+| `MOTRIX_TRUSTED_PROXY_IPS` | 可信反向代理的直接对端 IP，逗号分隔 | 空，不读取代理来源 Header |
+
+`MOTRIX_FNOS_ACCESSIBLE_PATHS_FILE` 只保存 Rust server 通过官方 API 确认的授权目录快照；正式包不再读取 `TRIM_DATA_ACCESSIBLE_PATHS` 或从应用设置回写旧快照。
+
+支持开放 API 的 fnOS 会同时向正式 `motrix` 进程注入 `TRIM_API_TOKEN`。server 启动时在读取授权快照前通过官方 Unix Socket 尝试刷新一次；成功结果（包括空数组）原子覆盖快照，Token、Socket 或网关不可用时保留最后一次官方 API 快照并继续启动。Token 不得进入前端、SQLite、日志、诊断包或 HTTP 响应。
+
+监听器约定：
+
+- 管理入口（IPv4/IPv6）只承载 Web UI、`/api/*` 与 `/api/events`，未知路径统一返回 `404 Not Found`。
+- 回环 JSON-RPC 监听器只绑定回环地址，只注册精确的 `GET`、`POST` 和 `OPTIONS /jsonrpc`；其他路径统一返回 `404 Not Found`，不配置 SPA fallback。
+- 局域网 JSON-RPC 监听器启动时始终尝试绑定 IPv4 `17082`；仅 `AddrInUse` 错误允许该入口降级不可用，保留管理和回环 RPC 服务。释放端口后须重启应用恢复，不自动换端口或重试。成功绑定后，入口关闭时精确路径也返回 `404`。开启后默认只接受 RFC1918 IPv4 真实对端；管理员显式启用 RFC 6598 共享地址支持后，额外接受 `100.64.0.0/10`，其他来源返回 `403`。该判断不得读取 `X-Forwarded-For`。
+- `MOTRIX_FNOS_JSONRPC_ADDR` 在 FPK 中必须解析为回环地址，且不得进入 manifest、`MotrixFNOS.sc` 或 fnOS 端口映射。
+- `MOTRIX_FNOS_LAN_JSONRPC_ADDR` 在 FPK 中固定为 `0.0.0.0:17082`，通过 `MotrixFNOS.sc` 与管理端口共同声明，但不得成为 manifest 或桌面入口端口。
+- 三类入口共享业务状态和退出信号；管理入口在 IPv4 通配地址下以 IPv6-only socket 同时绑定同端口 IPv6。除局域网 RPC 的 `AddrInUse` 降级外，任一实际地址绑定失败时 server 整体启动失败。
+
+## 2. 前端消费约定
+
+- FPK Web UI 从 manifest `service_port` 对应的管理端口访问后端，API 与 SSE 使用同源 `/api/*` 和 `/api/events`。
+- FPK 桌面入口与 Rust server 使用同一端口；不得再同时声明统一网关字段并把该端口限制成仅 JSON-RPC。
+- 浏览器管理请求使用 `Authorization: Bearer <JWT>`；统一 HTTP client 与 SSE 使用 `credentials: "same-origin"`，保留上游网关的同源 Cookie 传输，Motrix 自身仍只依据 JWT 校验管理权限。FN Connect 的凭据兼容与待验边界见 [故障排查](maintenance.md#常见问题)。
+- `/jsonrpc` 只存在于两个 RPC listener，不与 Web UI 共用监听器；回环反代和局域网写操作分别要求独立 Token。
+- 开发态由 Vite proxy 转发 `/api` 与 `/api/events` 到本地 server。
+- JSON 接口使用浏览器原生 `fetch`。
+- SSE 使用 `fetch` 和 `ReadableStream` 解析，以请求头传递 JWT，令牌不得写入 URL。
+- 错误提示按稳定 `code` 和当前界面语言展示；中文沿用响应 `message`，英文使用前端字典，未知中文错误码显示可追查的通用提示。原始 `message` 保留在错误对象、任务快照与诊断中；外部引擎诊断和用户路径不逐字替换。非标准错误按 HTTP 状态码展示通用错误。
+- 更新检查、后端通信和引擎状态使用响应状态字段生成当前语言的提示，不依赖后端消息的文字判断。新增业务错误码须同步补充中英字典；任务恢复状态的稳定消息前缀也由同一字典解释。
+- 下载保存目录只允许从后端返回的 fnOS 已授权目录中选择；Web UI 不提供任意本地路径选择器。
+
+## 3. 错误响应
+
+由业务 handler 返回的错误使用统一 JSON 响应：
+
+```json
+{
+  "code": "task_conflict",
+  "message": "应用正在退出，不能执行任务操作"
+}
+```
+
+状态码约定：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `400 Bad Request` | 请求参数非法或业务校验失败 |
+| `401 Unauthorized` | 管理 JWT 缺失、格式错误、无效、过期或失效；不得返回 SPA HTML |
+| `403 Forbidden` | 当前凭据无权执行操作 |
+| `404 Not Found` | `/api` 下不存在的路径；可能不带 JSON body |
+| `408 Request Timeout` | 请求在资源限制层超时；可能不带 JSON body |
+| `409 Conflict` | 当前运行状态不允许执行该操作 |
+| `413 Payload Too Large` | 请求体超过接口大小限制；可能不带 JSON body |
+| `429 Too Many Requests` | 登录/密码验证失败限速或密码哈希并发达到上限 |
+| `502 Bad Gateway` | Aria2 明确拒绝任务代理等运行选项 |
+| `503 Service Unavailable` | Aria2 生命周期转换或运行依赖暂时不可用 |
+| `500 Internal Server Error` | 未预期内部错误 |
+
+`204 No Content` 响应不带 JSON body。
+
+`404`、`408` 与 `413` 由路由或资源限制层在进入业务 handler 前生成，不保证返回 `{ "code", "message" }`。调用方必须按 HTTP 状态码处理这三类响应。
+
+## 4. HTTP API
+
+下表使用同源 `/api` 路径，FPK 与开发态保持一致。
+
+### 4.1 Web 管理鉴权
+
+静态资源允许匿名加载，但不得包含任务、路径、设置、日志或 Token 等业务数据。除本节明确标记为匿名的接口外，所有 `/api/*` 与 `/api/events` 都要求有效管理员 JWT。密码修改通过请求体中的当前密码确认，不依赖 JWT。
+
+| 方法 | 路径 | 访问要求 | 作用 |
+| --- | --- | --- | --- |
+| `GET` | `/api/auth/status` | 匿名 | 返回初始化和当前 JWT 状态 |
+| `POST` | `/api/auth/login` | 匿名 | 验证密码并签发 JWT |
+| `GET` | `/api/auth/login-diagnostic` | 匿名 | 下载脱敏登录排障 ZIP |
+| `POST` | `/api/auth/logout` | 匿名 | 返回 `204`；前端清除 JWT |
+| `PUT` | `/api/auth/password` | 当前密码 | 修改密码并签发新 JWT |
+
+`GET /api/auth/status` 响应：
+
+```json
+{
+  "setupRequired": false,
+  "authenticated": true
+}
+```
+
+约定：
+
+- `setupRequired=true` 表示本机管理密码缺失，网页显示恢复提示和脱敏诊断，不提供初始化表单。受保护的管理 API 与 SSE 返回 `401 Unauthorized`；匿名认证、登录诊断、就绪探测与静态资源仍可访问，但不会开放管理功能。
+- `status` 只验证当前请求的 `Authorization`，不会签发或返回新的 JWT。JWT 缺失、格式错误或无效时返回 `authenticated=false`。
+- `login` 和密码修改成功时，在上述状态字段外返回 `accessToken`；前端先保存它，再调用 `status` 确认后启动业务请求。
+- 前端以内存保存 JWT，并尽力写入 `localStorage` 以支持刷新恢复；浏览器禁止存储时退化为当前页面会话。JWT 原文不得写入诊断、日志、URL 或跨标签页消息。
+- 鉴权配置读取失败时 `status` 安全失败。
+
+登录页还可以匿名调用 `GET /api/auth/login-diagnostic` 下载轻量排障 ZIP。它只包含版本、管理监听地址、JWT 传输摘要、脱敏鉴权调试记录和生命周期日志尾部；不会包含密码、JWT 原文、SQLite、Aria2 或下载内容。接口同一时间只生成一个诊断包，忙时返回 `429 login_diagnostic_busy`，并带 `Retry-After: 1`。
+
+首次设密在 fnOS 安装向导中输入并确认，由 `install_callback` 调用本机 `initialize-web-auth` 写入 Argon2id 哈希。向导两项密码允许留空，方便保留数据重装时直接下一步；安装回调按数据库中的有效鉴权状态判断，已配置实例沿用原密码并忽略本次输入，未配置实例缺少有效密码则安装失败并提示重新填写。仅存在数据目录或数据库文件不代表已设密；静态向导不会预先检测或隐藏密码框。`POST /api/auth/setup` 已移除并返回 `404`，不再使用 bootstrap token。
+
+`POST /api/auth/login` 请求：
+
+```json
+{
+  "password": "user-entered-password"
+}
+```
+
+- `login` 失败统一返回相同的 `401` 错误，不区分密码不存在、密码错误或内部状态；连续失败返回 `429` 或施加递增延迟。
+- 登录和密码修改共用失败限速：同一来源 5 分钟内 5 次密码验证失败后锁定 30 秒；全局累计 100 次失败也会锁定 30 秒。达到限速时返回 `429 login_rate_limited` 和 `Retry-After`。
+- 限速来源使用管理 listener 的真实对端 IP。只有对端 IP 命中 `MOTRIX_TRUSTED_PROXY_IPS` 时，才使用 `X-Forwarded-For` 中第一个合法 IP；直连、未配置或未命中的代理都忽略该 Header。
+- 本机初始化、重置、login 和密码修改的 Argon2 操作最多并行 2 个，超额请求快速返回 `429 password_hash_busy` 和 `Retry-After: 1`。哈希任务在受限阻塞线程中执行，请求取消后仍占用并发名额，直到该任务结束。
+
+`PUT /api/auth/password` 请求：
+
+```json
+{
+  "currentPassword": "current-password",
+  "newPassword": "new-password"
+}
+```
+
+- JWT 使用 HS256，Claims 固定包含 `sub="admin"`、`role="admin"`、`iat`、`exp` 和 `auth_version`；有效期为 12 小时。签名密钥为 32 字节随机值，持久化在 SQLite，重启后仍可验证既有 JWT。
+- 密码修改与本地重置必须递增 `authVersion`，使旧 JWT 失效；密码修改成功响应返回新 JWT。升级时会把旧版关闭的保护状态恢复为启用并递增 `authVersion`。
+- `logout` 不撤销服务端状态，只返回 `204`；前端必须清除内存和本地 JWT。
+- 密码明文、密码哈希、JWT 原文与 JSON-RPC Token 不得写入日志、普通设置响应或调试日志。
+- 密码修改先验证当前密码，再生成新密码哈希；更新同时匹配旧哈希和 `authVersion`，防止并发改密覆盖较新的凭据。
+- `reset-web-auth` 只能在 NAS 本机停止应用后执行，要求交互式终端隐藏输入并确认新密码，直接写入哈希并递增鉴权版本。输入取消、密码不匹配或不符合规则时保留原密码；不提供公网重置入口。任务、Aria2 session、下载设置、JSON-RPC Token、授权目录与下载文件均保留。
+- SQLite schema v7 的历史 `bootstrap_token_hash` 和 `bootstrap_token_expires_at` 列保留以避免破坏既有迁移；不再读写 token，初始化、改密与重置时清空历史值。已设置密码的实例升级保留原密码；旧版尚未设置密码的实例须保留数据重装，在安装向导设密，或使用本机重置命令。
+- 升级后旧浏览器 Cookie 不再生效，用户需重新登录；任务、设置和下载数据不受影响。
+
+密码使用 Argon2id 和随机 salt 保存不可逆哈希。Web 管理不使用 Cookie、服务端 Session 或 CSRF Token。
+
+统一鉴权错误示例：
+
+```json
+{
+  "code": "jwt_expired",
+  "message": "管理访问令牌已过期，请重新登录",
+  "reason": "jwt_expired"
+}
+```
+
+JWT 鉴权失败响应包含稳定的 `code` 和同值的 `reason`，用于排障；前端收到 `401` 后清除 JWT、停止业务请求并回到登录页。当前枚举为：
+
+- `jwt_missing`：请求未携带 Bearer JWT
+- `jwt_malformed`：Authorization 或 JWT 格式无效
+- `jwt_invalid`：JWT 签名、算法或内容无效
+- `jwt_expired`：JWT 已过期
+- `jwt_auth_version_mismatch`：密码修改、本地重置或升级恢复保护后旧 JWT 失效
+- `jwt_insufficient_privileges`：JWT 不具有管理员权限
+
+服务端会在脱敏调试日志中记录 `request_id`、请求路径和上述原因，不记录 JWT 原文或密码。
+
+### 4.2 应用信息
+
+| 方法 | 路径 | 响应 |
+| --- | --- | --- |
+| `GET` | `/api/app/info` | `AppInfo` |
+| `GET` | `/api/app/ping` | `BackendPing` |
+| `GET` | `/api/app/ready` | `AppReadiness` |
+| `GET` | `/api/app/compatibility` | `AppCompatibility`（需管理 JWT） |
+| `GET` | `/api/app/update-check` | `AppUpdateCheck` |
+
+`AppInfo` 示例：
+
+```json
+{
+  "name": "Motrix",
+  "version": "<currentVersion>",
+  "backendStatus": "ready",
+  "maintainer": "rockerhx",
+  "repositoryUrl": "https://github.com/RockerHX/motrix-fnos",
+  "releasePageUrl": "https://github.com/RockerHX/motrix-fnos/releases",
+  "targetArch": "x86_64",
+  "updateMode": "manual_fpk_or_app_center"
+}
+```
+
+`AppReadiness` 就绪响应：
+
+```json
+{
+  "ready": true
+}
+```
+
+约定：
+
+- `/api/app/ready` 仅用于 Rust 服务生命周期探测，无需管理 JWT。
+- 只有管理与 JSON-RPC listener 已绑定、启动门禁已经完成且服务未进入退出状态时返回 `200 OK`；其他状态返回 `503 Service Unavailable` 和 `app_not_ready`。
+- SQLite 初始化仍是 listener 标记就绪前的启动门禁，但 ready 请求本身只读取内存状态，不获取数据库连接、不执行 SQL、不写日志。
+
+`AppCompatibility` 返回 `engineGeneration`（`legacy-v1` / `native-v2` / `unknown`）、`mode`（`normal` / `restricted`）、`reasonCode`、`unfinishedTaskCount`、`unresolvedOperationCount` 和脱敏 `message`。受限管理保留登录、读取、诊断和停服，拒绝下载写操作与引擎启动；HTTP 返回 `409 engine_upgrade_required`，外部 RPC 创建返回 `-32005`。`ready=true` 只代表管理服务就绪，不代表允许下载。
+
+内置引擎及 `MOTRIX_FNOS_ARIA2_PATH` 外部路径仅支持已验证的 Aria2 Next 2.8.6。2.5.5 仍返回 `engineGeneration=legacy-v1`，但以 `reasonCode=engine_unsupported` 进入受限管理；未知或探测失败返回 `unknown` / `engine_unknown`。缺失、不可执行、探测超时均不降级运行旧引擎。受限启动不加载任务、不恢复或清理任务文件；历史记录、凭据、session 和文件保留，不能用更换路径接管旧任务。HTTP、SSE 与 RPC 的现有字段结构及上述错误响应保持不变。
+
+2.x 不导入、展示、继续或恢复 1.x 任务，首次跨代升级后任务列表从空列表开始，旧记录及下载文件保留原处，任务编号跨代不复用。读取边界在解析内容前排除可确定属于旧代的任务、文件快照和未完成操作，旧任务损坏或未完成也不阻止升级。当前代或归属不明的损坏数据仍安全阻断，当前引擎无法确认时仍拒绝下载。密码、设置、目录授权和 RPC Token 沿用；新引擎不加载旧 session 或执行旧操作。升级向导使用单项 `checkbox` 要求用户主动同意兼容性与备份说明，按数组类型校验必选，不配置默认选中值。`upgrade_init` 在文件替换前校验 `wizard_upgrade_acknowledged`，接受单项字符串 `true` 及其紧凑 JSON 数组表示 `["true"]`，并兼容原开关值 `1`，其他值拒绝升级；不将确认标记写入应用数据。静态向导在每次升级均显示，任务不兼容说明仅针对 1.x。升级脚本仍确认停服，不自动备份或迁移旧任务；回滚条件见 [备份与回滚](maintenance.md#备份与回滚)。
+
+`AppUpdateCheck` 示例：
+
+```json
+{
+  "currentVersion": "<currentVersion>",
+  "latestVersion": "<latestVersion>",
+  "hasUpdate": true,
+  "status": "available",
+  "releaseUrl": "https://github.com/RockerHX/motrix-fnos/releases/tag/v1.3.4",
+  "assets": [
+    {
+      "architecture": "x86",
+      "name": "motrix_1.3.4_x86.fpk",
+      "downloadUrl": "https://github.com/RockerHX/motrix-fnos/releases/download/v1.3.4/motrix_1.3.4_x86.fpk"
+    },
+    {
+      "architecture": "arm",
+      "name": "motrix_1.3.4_arm.fpk",
+      "downloadUrl": "https://github.com/RockerHX/motrix-fnos/releases/download/v1.3.4/motrix_1.3.4_arm.fpk"
+    }
+  ],
+  "checkedAt": 1760000000000,
+  "message": "检测到新版本，请下载匹配设备架构的 FPK 后在 fnOS 应用中心手动安装。"
+}
+```
+
+约定：
+
+- `updateMode` 当前固定为 `manual_fpk_or_app_center`，表示应用内只提供版本检测和更新提示，不执行 FPK 自动安装。
+- `targetArch` 使用运行中 server 的 CPU 架构，用于前端提示用户选择 x86 或 ARM 包。
+- `GET /api/app/update-check` 由后端请求 GitHub Releases latest；网络失败或解析失败时仍返回 `200 OK`，`status` 为 `unavailable`，并给出可展示 `message`。
+- `assets` 只识别 `*_x86.fpk` 与 `*_arm.fpk`；无法识别的附件不返回给前端。
+
+### 4.3 Aria2
+
+| 方法 | 路径 | 说明 | 响应 |
+| --- | --- | --- | --- |
+| `GET` | `/api/aria2/config` | 读取 Aria2 配置状态 | `Aria2ConfigStatus` |
+| `GET` | `/api/aria2/process` | 读取受管进程状态 | `Aria2ProcessStatus` |
+| `GET` | `/api/aria2/rpc` | 读取 RPC 连通状态 | `Aria2RpcStatus` |
+| `POST` | `/api/aria2/start` | 启动受管 Aria2 | `Aria2ProcessStatus` |
+| `POST` | `/api/aria2/stop` | 停止受管 Aria2 | `Aria2ProcessStatus` |
+
+上述读取接口不得因为查询启动 Aria2。`/api/aria2/rpc` 在 Aria2 停止时直接返回 `connected=false` 的停止态，不发起 RPC 探测。
+需要 Aria2 的任务操作、外部 `aria2.addUri`、启动恢复和后台监控统一经过生命周期协调器；不需要引擎的回收站永久删除等操作保持独立。
+`POST /api/aria2/stop` 遇到活动任务、metadata、在途操作或排队请求时返回 `409 Conflict`，错误码为 `aria2_busy`，不隐式暂停任务。空闲停止先保存必要状态和 session，确认进程退出后才清除运行态；保存或停止失败时保留运行态并返回 `503 Service Unavailable`，错误码为 `aria2_stop_failed`，客户端可以重试。
+
+### 4.4 任务
+
+| 方法 | 路径 | 请求 | 响应 |
+| --- | --- | --- | --- |
+| `GET` | `/api/tasks` | - | `DownloadTask[]` |
+| `GET` | `/api/tasks?status=removed` | - | `DownloadTask[]` |
+| `GET` | `/api/tasks/:id/file-context?language=zh-CN` | - | `TaskFileContextResponse` |
+| `POST` | `/api/tasks` | `CreateDownloadTaskRequest` | `DownloadTask` |
+| `POST` | `/api/tasks/batch` | `CreateBatchDownloadTasksRequest` | `CreateBatchDownloadTasksResponse` |
+| `POST` | `/api/tasks/torrent` | `multipart/form-data` | `DownloadTask` |
+| `POST` | `/api/tasks/:id/confirm` | `ConfirmTaskFilesRequest` | `DownloadTask` |
+| `POST` | `/api/tasks/:id/pause` | - | `DownloadTask` |
+| `POST` | `/api/tasks/:id/resume` | - | `DownloadTask` |
+| `POST` | `/api/tasks/:id/redownload` | 可选 `TaskProxyOverrideRequest` | `DownloadTask` |
+| `POST` | `/api/tasks/:id/restore` | 可选 `TaskRestoreRequest` | `DownloadTask` |
+| `PUT` | `/api/tasks/:id/proxy` | `UpdateTaskProxyRequest` | `DownloadTask` |
+| `DELETE` | `/api/tasks/:id`（兼容 `deleteFiles=false`） | - | `DownloadTask` |
+| `DELETE` | `/api/tasks/:id/permanent?deleteFiles=true\|false`（默认 `false`） | - | `204 No Content` 或 `202 DownloadTask` |
+
+约定：
+
+- `GET /api/tasks` 只返回未删除任务。
+- 普通 `GET /api/tasks` 和 WebUI 普通刷新只返回内存任务快照，不启动 Aria2 或执行无变化完整持久化；活动任务由后台监控或明确任务操作刷新，不新增独立同步 API。
+- `GET /api/tasks?status=removed` 只返回已删除任务记录，用于回收站页面。
+- `status` 当前只支持 `removed`；其他值返回 `400 Bad Request`。
+- `POST /api/tasks/:id/restore` 只允许恢复 `removed` 任务；未完成任务恢复为暂停，已完成历史恢复为完成，均不会立即下载或做种。
+- 已完成任务及其回收站历史以 SQLite 记录为准；引擎启动核对身份和停止状态后，不用重载的文件列表或进度覆盖历史，也不恢复其代理选项。外部删除完成文件不阻塞新任务，不自动重建或下载；文件上下文按实际路径返回 `path_missing`。未完成任务仍执行完整恢复校验。
+- 原生任务暂停或删除前无法确认引擎停止写入时返回 `503 Service Unavailable`、`task_pause_unconfirmed`；暂停确认含 RPC 等待共用 10 秒预算，失败时保留原任务、GID 和文件，不标记已暂停、不暂存或删除内容、不自动继续下载，提示停止并重启应用后核对。强制终止引擎不等于原生状态已成功提交，最近进度可能回退。
+- 任何会写入用户下载目标或暂存/删除用户文件的继续、恢复、重新下载、磁链确认、stale GID 重建及 `deleteFiles=true` 操作，均按任务保存目录、专属目录和文件归属重新检查当前授权；授权已撤销时返回 `403 Forbidden`（`save_dir_not_authorized`），不得唤醒后写入、重建目录或暂存/删除用户文件。待确认磁链的 metadata 只写应用私有目录；确认文件并设置实际下载目录时仍须检查用户目录授权。
+- 成功刷新共享目录授权后，服务端会尝试暂停正在运行且目标已撤权的任务；暂停后的同步或持久化失败时保持 Aria2 暂停并留下待对账操作，不发送补偿性 `unpause`。暂停结果无法确认时也不恢复下载。
+- `POST /api/tasks/:id/redownload` 只允许重新下载 `complete` 任务。服务端先按原来源创建暂停任务并持久化，再暂存旧文件；新任务恢复成功后才清理暂存文件。任一步失败会恢复旧任务和原文件。URL 使用 `addUri`，种子和已确认磁链使用保存的源 metadata 调用 `addTorrent`。
+- HTTP 恢复与重新下载可省略请求体；省略 `useProxy` 时继承原代理绑定，改变开关时使用应用代理配置，相同值保留旧兼容绑定。BT 请求不得包含 `useProxy`（含 `false` / `null`），统一使用 BT 总代理。
+- 恢复与重新下载必须在创建目录、提交 GID 或暂存旧文件前确认所继承或覆盖的代理可用。校验或应用失败时保持原任务、文件和回收站状态，不得回退为直连。
+- 同一任务已有重新下载操作时，重复请求返回 `409 Conflict`，错误码为 `task_operation_conflict`。
+- 原生未完成任务保留文件恢复时复用原 ID/GID、路径、session 和原生状态，不重新创建下载。内容已删除时须显式提交 `restartFromZero=true`，否则返回 `409 task_restart_confirmation_required`；确认后创建从零开始的暂停尝试。文件未删除却要求从零恢复返回 `400 task_restore_options_invalid`。
+- 原生 GID/恢复状态无效或完整 metadata 缺失时返回 `409 task_resume_state_invalid` / `task_metadata_missing`，保留文件和回收站记录，不另建 GID 接管半成品。清理未完成时恢复和永久删除返回 `409 file_cleanup_pending`。旧代任务不在新版内存任务集中，旧 ID 按不存在处理，不能据此承诺统一返回 `409 task_engine_incompatible`。
+- 旧 ID 与任意不存在的 ID 使用相同响应：继续、文件确认和未提交代理覆盖的重新下载返回 `400 task_operation_failed`；暂停在引擎就绪后同样返回 `400 task_operation_failed`（启动失败可先返回引擎错误）。移入回收站、恢复、永久删除、任务代理及文件上下文查询返回 `404 task_not_found`。重新下载显式提交 `useProxy` 时会先查任务，缺失也返回 `404 task_not_found`。这些响应以认证、请求格式和运行状态等前置检查通过为前提；`task_engine_incompatible` 保留给实际加载任务的代际不匹配校验。
+- `DELETE /api/tasks/:id` 只移入回收站并保留原位置的下载文件、进度和恢复信息。2.0.1 起旧参数 `deleteFiles=true` 返回 `400 task_delete_files_moved`，不改变任务和文件，提示先移入回收站，再使用永久删除接口；省略或 `false` 保持兼容。
+- `DELETE /api/tasks/:id/permanent?deleteFiles=true|false` 只允许永久删除回收站任务；省略或 `false` 释放引擎记录、session 引用、无共享引用的私有恢复信息及数据库记录，保留用户下载文件，成功返回 `204 No Content`。
+- 永久删除显式 `deleteFiles=true` 时校验当前授权与任务文件归属，确认引擎停止写入后原子暂存文件并持久化 `file_cleanup_pending` 操作。需要后台清理时返回 `202 Accepted` 与 `DownloadTask`（`cleanupState=pending`），记录保留在回收站；清理成功后才移除记录。失败显示 `cleanupState=failed` 并自动重试，重启继续清理；清理期间恢复和重复永久删除返回 `409 file_cleanup_pending`。无文件需要清理或旧记录已为 `filesDeleted=true` 时不重复删除，立即完成返回 `204`。
+- 永久删除同时清理该任务位于应用私有目录的恢复 metadata；该清理不属于用户下载文件删除。尚在解析或等待确认、未进入内容下载的磁链即使收到 `deleteFiles=true` 也仅清理私有数据，不检查用户下载目录授权、不暂存或删除用户文件，成功返回 `204`；已确认并建立专属下载目录的磁链仍执行完整授权与归属检查，不能以进度为零跳过。
+- 磁链在应用私有目录解析 metadata，全程保持同一 GID；引擎 `bittorrent.fileSelectionState=awaiting` 时任务暂停并设置 `confirmationRequired=true`。前端展示 `files`，确认文件后才开始写入用户下载目录。
+- 磁链确认时在已授权父目录下设置任务专属目录；完整 metadata 和文件选择随原生状态持久化，不依赖导出 `.torrent`、`.aria2` 控制文件或后继 GID。
+- 当 `confirmationRequired=true` 时，普通 `/api/tasks/:id/resume` 会返回 `400 Bad Request`，提示先确认要下载的文件，避免绕过文件选择。
+
+`TaskFileContextResponse`：
+
+```json
+{
+  "saveDir": {
+    "path": "/vol1/1000/downloads",
+    "displayPath": "存储空间1/admin 的文件/downloads"
+  },
+  "filePath": {
+    "path": "/vol1/1000/downloads/demo.pdf",
+    "displayPath": "存储空间1/admin 的文件/downloads/demo.pdf"
+  },
+  "actions": {
+    "availability": "available",
+    "fileManagerPath": "/vol1/1000/downloads/demo.pdf",
+    "openFilePath": "/vol1/1000/downloads/demo.pdf",
+    "detailPaths": ["/vol1/1000/downloads/demo.pdf"]
+  }
+}
+```
+
+约定：
+
+- 接口只接受 URL 中的任务 ID，不接受客户端路径；任务不存在返回 `404 task_not_found`。
+- `language` 只接受 `zh-CN` 或 `en-US`；缺失时按 `zh-CN`，非法值返回 `400 display_language_invalid`。
+- `saveDir` 和存在时的 `filePath` 同时返回真实路径与语义化展示路径。路径转换失败或开放 API 不可用时 `displayPath` 回退为对应 `path`，不改变文件操作判定。
+- `actions.availability` 为 `available`、`task_not_complete`、`files_deleted`、`path_missing`、`partial_missing`、`storage_unavailable`、`path_unauthorized` 或 `unsupported_layout`。除 `available` 和 `partial_missing` 外，所有操作目标均为 `null` 或空数组。授权根目录不可访问时优先返回 `storage_unavailable`，不据此认定内容已删除；权限已撤销返回 `path_unauthorized`。
+- URL 任务必须已完成、文件未删除，目标是存在的普通文件，且 `canonicalize` 后仍位于当前授权根目录；可用时文件路径同时作为文件管理器定位、打开文件和文件详情目标。
+- BT/磁力任务只接受明确持久化的 `ownedTaskDir`。目标必须是存在的非符号链接目录并处于当前授权根内；可用时只提供文件管理器和目录详情目标，不提供打开文件目标。历史任务缺少该字段时返回 `unsupported_layout`。
+- BT/磁力任务只核对记录中已选择文件的存在与安全路径，不扫描目录或校验内容 hash；全部缺失返回 `path_missing`，部分缺失返回 `partial_missing`，后者仍可定位现存任务目录及查看目录详情。该查询不改变历史完成状态、进度、GID 或 `filesDeleted`。
+- 授权快照无法读取时失败关闭并返回 `500 task_file_context_failed`。每次文件操作都必须重新请求本接口；前端缓存的 `DownloadTask.filePath` 或旧上下文不得直接交给宿主 SDK。
+
+`CreateDownloadTaskRequest`：
+
+```json
+{
+  "url": "https://example.com/file.zip",
+  "fileName": "file.zip",
+  "saveDir": "/vol1/downloads",
+  "sourceType": "url",
+  "startMode": "now",
+  "category": "默认",
+  "advancedOptions": {
+    "connections": 8,
+    "downloadLimitKb": 0,
+    "useProxy": false
+  }
+}
+```
+
+约定：
+
+- `sourceType` 可选值为 `url` / `magnet`；种子文件通过 `/api/tasks/torrent` 上传，不在 JSON 请求中传 `torrent`。省略时兼容旧请求并按 `url` 处理。
+- `startMode` 可选值为 `now` / `paused`，省略时按 `now` 处理。
+- `category` 是 Motrix 任务标签，默认 `默认`；它不改变保存目录，也不影响侧栏状态分类。
+- `advancedOptions.connections` 为 `1..=64` 的整数，原生引擎映射 `stream-max-connections`；`advancedOptions.downloadLimitKb` 映射单任务下载限速。
+- HTTP 的 `advancedOptions.useProxy` 是可选布尔值，缺失按 `false`；BT 禁止任务级代理字段，即使为 `false` / `null` 也返回 `400 bt_task_proxy_unsupported`。HTTP 请求中该值为 `true` 时绑定当前应用代理配置；配置不存在时返回 `400 proxy_not_configured`，并且不创建任务、目录或 Aria2 GID。
+- 旧 `advancedOptions.proxy` 继续兼容：未同时提供 `useProxy` 时，非空原始值作为该任务的私密兼容覆盖并映射 `all-proxy`。同时提供 `useProxy` 与非空 `advancedOptions.proxy` 时返回 `400 proxy_conflict`。
+- `saveDir` 必须是 `/api/storage/accessible-paths` 返回的授权目录本身或其子目录；为空或未授权路径会返回 `400 Bad Request`。缺失子目录会在 Aria2 创建任务前由服务端创建。
+- 当 `sourceType=magnet` 时，请求中的 `saveDir` 表示授权父目录；解析阶段仍保留该父目录，确认时才切换到任务专属子目录；解析用目录位于应用私有数据区。
+- BT 任务返回的 `ownedTaskDir` 是后端创建并持久化的外层任务目录；它独立于会随种子 metadata 更新的 `fileName`，仅用于任务恢复和安全删除。普通 URL 任务为 `null`。
+- `aria2Options` 为兼容字段；Web UI 不直接使用该字段，外部调用或 `/jsonrpc` 兼容入口可传入受支持的 Aria2 参数。
+- `aria2Options["all-proxy"]` 遵循与旧 `advancedOptions.proxy` 相同的私密兼容规则；同时提供 `useProxy` 与非空原始代理字段时返回 `400 proxy_conflict`。两个非空原始代理字段同时存在时返回 `400 proxy_conflict`。BT 不接受这些字段或 `bt-proxy` 等任务级代理选项。
+- 后端只透传白名单选项并覆盖 `dir` / `out`。新旧连接参数混用、废弃参数、服务管理参数分别返回 `400 aria2_option_conflict` / `aria2_option_unsupported` / `aria2_option_forbidden`；具体选项规则见第 6 节。
+
+`DownloadTask`：
+
+```json
+{
+  "id": 1,
+  "engineGeneration": "native-v2",
+  "readOnly": false,
+  "url": "https://example.com/file.zip",
+  "sourceType": "url",
+  "fileName": "file.zip",
+  "saveDir": "/vol1/downloads",
+  "ownedTaskDir": null,
+  "category": "默认",
+  "gid": "abc123",
+  "status": "pending",
+  "totalLength": 1024,
+  "completedLength": 0,
+  "downloadSpeed": 0,
+  "errorCode": null,
+  "errorMessage": null,
+  "filePath": "/vol1/downloads/file.zip",
+  "useProxy": false,
+  "filesDeleted": false,
+  "cleanupState": "none",
+  "metadataState": "none",
+  "confirmationRequired": false,
+  "files": [],
+  "createdAt": 1760000000000,
+  "updatedAt": 1760000000000
+}
+```
+
+`DownloadTaskFile`：
+
+```json
+{
+  "index": 1,
+  "path": "/vol1/downloads/movie/file-a.mkv",
+  "name": "file-a.mkv",
+  "length": 1024,
+  "completedLength": 0,
+  "selected": true
+}
+```
+
+约定：
+
+- `category` 是任务标签，默认 `默认`。
+- `useProxy` 只表示 HTTP 任务的持久化代理意图，新建 BT 为 `false`，BT 是否使用代理以全局开关为准；响应不返回代理来源、配置 revision、代理 URL 或兼容覆盖值。
+- `confirmationRequired` 表示任务需要用户确认文件后才能继续下载。
+- `files` 来自引擎文件列表，SQLite 保存 `selectedFileIndexes` 等恢复事实；重启后从 session/native metadata 恢复文件列表和选择，不依赖在线节点重新获取完整 metadata。公开响应不暴露私有 metadata 路径。
+- HTTP API 与 SSE 使用同一公开任务结构，增加 `engineGeneration`、`readOnly`、`filesDeleted`、`cleanupState`（`none` / `pending` / `failed`）和 `metadataState`（`none` / `resolving` / `awaiting` / `ready` / `error`）。
+- `DownloadTaskFile.index` 使用 Aria2 原生 one-based 文件索引，前端不得重排后再提交。
+
+`CreateBatchDownloadTasksRequest`：
+
+```json
+{
+  "urls": ["https://example.com/file-a.zip", "https://example.com/file-b.zip"],
+  "saveDir": "/vol1/downloads",
+  "startMode": "now",
+  "category": "默认",
+  "advancedOptions": {
+    "connections": 8,
+    "downloadLimitKb": 0,
+    "useProxy": false
+  }
+}
+```
+
+`CreateBatchDownloadTasksResponse`：
+
+```json
+{
+  "created": [],
+  "failed": [
+    {
+      "input": "ftp://example.com/file.zip",
+      "code": "task_operation_failed",
+      "message": "当前仅支持 HTTP / HTTPS 下载链接"
+    }
+  ]
+}
+```
+
+批量失败项的 `code` 自 2.0.7 起提供，与单条任务错误分类一致，供客户端国际化；旧客户端可忽略该新增字段。
+
+`POST /api/tasks/torrent` 使用 `multipart/form-data`：
+
+- `torrent`：种子文件，大小不得超过 10 MiB。
+- `request`：JSON 字符串，字段为 `saveDir`、`startMode`、`category`、`advancedOptions`。
+- 种子请求不接受 `advancedOptions.useProxy` / `proxy`，统一使用设置页的 BT 总代理。
+- `request.saveDir` 表示用户授权的父保存目录；服务端会按种子任务名创建专属子目录，并将 Aria2 下载目录设为该子目录。
+- 成功后返回创建出的 `DownloadTask`；`url` 存为 `torrent:<原始文件名>`，`saveDir` 为任务专属子目录。
+- 服务端将上传的原始种子备份到应用私有目录；原生状态保留完整 metadata 和文件选择，不在用户下载目录额外导出种子。
+
+`ConfirmTaskFilesRequest`：
+
+```json
+{
+  "selectedFileIndexes": [1, 3, 5]
+}
+```
+
+约定：
+
+- `selectedFileIndexes` 不能为空；后端会过滤非正数、去重并排序。
+- 后端将选择结果映射为 Aria2 `changeOption(gid, { "select-file": "1,3,5" })`，随后调用 `aria2.unpause` 开始真实 BT 下载。
+- 成功后返回更新后的 `DownloadTask`，其中 `confirmationRequired=false`，任务进入下载中状态。
+- 原生磁链确认在同一 GID 上设置目录和文件选择，再继续；重复确认返回 `409 task_already_confirmed`，无效选择返回 `400 task_file_selection_invalid`，不创建替代任务。
+- 服务端在 `unpause` 前核对 BT 总代理；代理无法解析或应用时保持暂停并返回结构化错误，不得直连。
+
+`UpdateTaskProxyRequest`：
+
+```json
+{
+  "enabled": true
+}
+```
+
+`TaskProxyOverrideRequest`（HTTP 重新下载）：
+
+```json
+{
+  "useProxy": true
+}
+```
+
+`TaskRestoreRequest` 可同时包含 HTTP 的可选 `useProxy` 与 `restartFromZero`（默认 `false`）；BT 仅允许后者。例如内容已删除后确认从头下载：
+
+```json
+{
+  "restartFromZero": true
+}
+```
+
+任务代理切换约定（仅 HTTP，BT 返回 `400 bt_task_proxy_unsupported`）：
+
+- 活动或已暂停且仍有有效 GID 的任务通过受控 `aria2.changeOption` 更新 `all-proxy`；运行中切换可能短暂重建连接，但不删除文件、不更换 Motrix 任务 ID。
+- Aria2 已停止时只保存任务意图，不为切换操作启动引擎。完成和回收站任务也只保存供将来继承的状态。
+- 开启应用代理而配置不存在时返回 `400 proxy_not_configured`。任务不存在返回 `404 task_not_found`；已有互斥操作返回 `409 task_operation_conflict`；生命周期转换返回 `409 runtime_transition`；Aria2 明确拒绝返回 `502 proxy_apply_failed`。
+- 对有效 GID，服务端先应用 Aria2 option 再提交 SQLite；持久化失败时补偿旧 option。RPC 结果未知时保留旧 SQLite 事实及未完成操作，响应不得假装成功。
+- 关闭旧兼容代理后删除私密覆盖并把来源转为应用配置；之后再次开启使用当前应用代理配置。
+
+任务代理持久化约定：
+
+- SQLite schema v4 为 `download_tasks` 增加 `use_proxy INTEGER NOT NULL DEFAULT 0` 与 `proxy_source TEXT NOT NULL DEFAULT 'profile'`。升级前任务统一迁移为关闭，其他任务字段保持不变，重复启动不得重复迁移。
+- 私密表 `task_proxy_overrides(task_id, proxy_url, updated_at)` 只保存旧接口的任务专属代理，`task_id` 为主键并随任务永久删除清理。普通任务读写不得把 `proxy_url` 复制到公开字段、操作记录或日志。
+- SQLite 任务意图是长期事实；Aria2 session 只用于恢复。HTTP 启动、继续和空闲重启都必须在 unpause 前按 SQLite 对账 `all-proxy`；BT 在网络活动前核对全局 `bt-proxy`，失败时保持暂停或进入可诊断错误状态。
+
+### 4.5 设置
+
+| 方法 | 路径 | 请求 | 响应 |
+| --- | --- | --- | --- |
+| `GET` | `/api/settings` | - | `AppConfig` |
+| `PUT` | `/api/settings` | `AppConfig` | `UpdateSettingsResponse`（兼容扁平 `AppConfig` 字段，附带可选 `runtimeApply`） |
+| `GET` | `/api/settings/jsonrpc-token` | - | `JsonRpcTokenStatus` |
+| `PUT` | `/api/settings/jsonrpc-token` | `UpdateJsonRpcTokenRequest` | `JsonRpcTokenStatus` |
+| `GET` | `/api/settings/lan-jsonrpc` | - | `LanJsonRpcStatus` |
+| `PUT` | `/api/settings/lan-jsonrpc` | `UpdateLanJsonRpcRequest` | `LanJsonRpcMutationResponse` |
+| `POST` | `/api/settings/lan-jsonrpc/token` | - | `LanJsonRpcMutationResponse` |
+| `GET` | `/api/settings/proxy` | - | `DownloadProxyStatus` |
+| `PUT` | `/api/settings/proxy` | `UpdateDownloadProxyRequest` | `DownloadProxyMutationResponse` |
+| `DELETE` | `/api/settings/proxy` | - | `204 No Content` |
+
+约定：
+
+- `GET /api/settings` 在没有已保存配置时，会从 `/api/storage/accessible-paths` 对应授权目录中选择默认下载目录：优先选择包含 `/data` 或以 `data` 结尾的目录，其次选择第一个授权目录；授权目录为空时才回退到 server 应用数据目录。
+- `PUT /api/settings` 的 `defaultDownloadDir` 必须来自已授权目录；授权目录为空时只允许使用 server 应用数据目录。未授权目录返回 `400 Bad Request`，错误码为 `settings_save_failed`。
+- `maxConcurrentDownloads` 默认值为 `5`，服务端规范化范围为 `1..=128`；`0` 会规范化为 `1`，超过 `128` 会规范化为 `128`。该限制由服务端执行，前端范围只是输入提示。
+- 下载调优统一为 `httpMaxConnections`（默认 `1`，整数 `1..=64`）、`connectTimeout`（默认 `60` 秒，规范化为 `1..=300`）和 `maxTries`（默认 `5`，规范化为 `1..=10`）。非法 HTTP 连接上限返回 `400 settings_connections_invalid`。
+- 调优字段保存后会与限速和并发一起通过 `aria2.changeGlobalOption` 应用；Aria2 未运行时不会因设置操作启动，并会在下一次受控启动、session 恢复前应用已保存的规范化配置。旧客户端省略这些新增字段时按上述默认值保存。
+- 旧设置 `split` / `maxConnectionPerServer` 归并到 `httpMaxConnections`，按各自默认值与范围规范化后取较小值；响应只返回新字段。新旧字段混用返回 `400 settings_option_conflict`，提交已废弃的 `minSplitSize` 返回 `400 settings_option_unsupported`。
+- `PUT /api/settings` 保存成功后不会因为 Aria2 未运行或即时应用失败而回滚配置；响应中的可选 `runtimeApply` 为 `applied`（已即时应用）、`deferred`（Aria2 未就绪或生命周期正在切换，将在下次受控启动时生效）或 `failed`（已尝试即时应用但 Aria2 拒绝/调用失败）。旧客户端可以忽略该字段。
+- `language` 为 Web UI 语言偏好，支持 `auto`、`zh-CN` 和 `en-US`。新安装、缺失字段或非法值回退为 `auto`；已有明确中英文值保留。继续写入现有 SQLite 下载设置 JSON，无需修改表结构；前端解析出的具体语言才可用于路径展示 API，不能将 `auto` 传给这些 API。自动模式及登录页优先级见 [UI 规范](design/DESIGN.md#布局与主题)。
+- `GET /api/settings` 和 `PUT /api/settings` 不接收、不返回 JSON-RPC Token；旧请求中的 `jsonRpcToken` 字段必须忽略或拒绝，不得回显原文。
+- JSON-RPC Token 通过专用受保护接口更新；保存后立即生效且无需重启 Aria2。
+- `GET /api/settings/jsonrpc-token` 只返回是否已配置和掩码，不返回 Token 原文。
+- JSON-RPC Token 为空时，`/jsonrpc` 的 `aria2.addUri` 会拒绝添加任务；`aria2.getVersion` 仍可用于连通性测试。
+- 局域网 JSON-RPC 配置使用独立的 `jsonrpc_lan` 持久化记录。首次启用且尚无 Token 时由服务端生成 32 字节随机 Token；关闭入口保留 Token，重新启用不影响已配置客户端。
+- `issuedToken` 只在首次生成或主动轮换时返回一次；普通读取、关闭和使用既有 Token 重新启用时必须为 `null`。任何响应和日志均不得回传或记录旧 Token 原文。
+- 下载代理以独立 `app_config` 键 `download_proxy` 保存规范化 URL、单调递增 revision 和更新时间，不属于公开 `AppConfig`。普通 `/api/settings` 不接收或返回该记录。
+- 代理 URL trim 后最长 2048 字节，使用结构化 URL 解析；只接受 `http`、`https`、`socks4`、`socks5`，要求合法 host 和 port，拒绝 query、fragment 与控制字符。允许 userinfo，但规范化不得改变凭据大小写或含义。
+- 保存相同的规范化 URL 是无变化操作：不增加 revision、不调用 Aria2、不触发任务重连。并发保存按数据库事务串行化 revision。
+- 替换配置本身成功后，不启动已停止的 Aria2。已运行且来源为应用配置的启用任务分别进入 `appliedTaskIds`、`deferredTaskIds` 或脱敏的 `failed`；部分即时应用失败不回滚已保存配置，后续在恢复、继续或显式操作时重新对账。
+- BT 总代理开启，或仍有 `useProxy=true` 且来源为应用配置的 HTTP 任务时，包含完成和回收站任务，清除配置返回 `409 proxy_in_use`。兼容私密覆盖任务不构成引用。成功清除返回 `204 No Content`。
+- `PUT /api/settings/proxy` 接受可选 `proxyUrl` 与 `btUseProxy`，至少提供一个字段；省略的字段保留原值。BT 总开关默认关闭，仅支持 HTTP/SOCKS4/SOCKS5；无地址或使用 HTTPS 分别返回 `400 bt_proxy_not_configured` / `bt_proxy_protocol_unsupported`。
+- BT 开关或共享地址变更先暂停受影响任务，再保存并核对全局 `bt-proxy`；暂停未确认则不保存，保存后应用失败则保留目标配置并返回 `btRuntimeApply=blocked`，禁止相关 BT 继续；引擎停止时为 `deferred`，核对成功为 `applied`。只在核对成功后恢复原先活动的任务，不激活原已暂停/回收站任务。
+- 代理设置加载或保存失败使用内部错误码 `proxy_load_failed`、`proxy_save_failed`；任何错误响应、日志和调试记录都不得包含代理原文或凭据。
+
+`AppConfig`：
+
+```json
+{
+  "defaultDownloadDir": "/vol1/downloads",
+  "maxConcurrentDownloads": 5,
+  "httpMaxConnections": 1,
+  "connectTimeout": 60,
+  "maxTries": 5,
+  "downloadLimit": 0,
+  "uploadLimit": 0,
+  "language": "zh-CN"
+}
+```
+
+`UpdateSettingsResponse` 在保持上述顶层 `AppConfig` 字段的同时，可附带：
+
+```json
+{
+  "defaultDownloadDir": "/vol1/downloads",
+  "maxConcurrentDownloads": 128,
+  "httpMaxConnections": 6,
+  "connectTimeout": 90,
+  "maxTries": 8,
+  "downloadLimit": 0,
+  "uploadLimit": 0,
+  "language": "zh-CN",
+  "runtimeApply": "applied"
+}
+```
+
+`runtimeApply` 不会写入 SQLite；`GET /api/settings` 始终只返回 `AppConfig`。
+
+`JsonRpcTokenStatus`：
+
+```json
+{
+  "configured": true,
+  "maskedToken": "••••••••a1b2"
+}
+```
+
+`UpdateJsonRpcTokenRequest`：
+
+```json
+{
+  "token": "new-json-rpc-token"
+}
+```
+
+`LanJsonRpcStatus`：
+
+`available` 表示局域网 RPC 监听器本次启动是否可用；端口被占用而降级时为 `false`。`enabled` 仍是持久化开关，二者独立；降级不清除 Token 或来源配置。GET、更新开关与轮换 Token 的响应均返回 `available`。旧服务端未返回该新增字段时，前端保留原显示逻辑。
+
+```json
+{
+  "enabled": true,
+  "available": true,
+  "configured": true,
+  "maskedToken": "••••••••a1b2",
+  "allowSharedAddressSpace": false,
+  "port": 17082
+}
+```
+
+`UpdateLanJsonRpcRequest` 与 `LanJsonRpcMutationResponse`：
+
+```json
+{
+  "enabled": true,
+  "allowSharedAddressSpace": false
+}
+```
+
+```json
+{
+  "status": {
+    "enabled": true,
+    "available": true,
+    "configured": true,
+    "maskedToken": "••••••••a1b2",
+    "allowSharedAddressSpace": false,
+    "port": 17082
+  },
+  "issuedToken": "one-time-raw-token-or-null"
+}
+```
+
+`DownloadProxyStatus`：
+
+```json
+{
+  "configured": true,
+  "maskedProxyUrl": "http://***:***@proxy.example.com:7890",
+  "revision": 4,
+  "btUseProxy": false,
+  "btRuntimeApply": "deferred"
+}
+```
+
+未配置时 `configured=false`、`maskedProxyUrl=null`、`revision=0`、`btUseProxy=false`、`btRuntimeApply=deferred`。用户名和密码统一掩码，响应不得包含 query、fragment 或可还原凭据的信息。
+
+`UpdateDownloadProxyRequest`：
+
+```json
+{
+  "proxyUrl": "http://user:password@proxy.example.com:7890",
+  "btUseProxy": true
+}
+```
+
+`DownloadProxyMutationResponse`：
+
+```json
+{
+  "status": {
+    "configured": true,
+    "maskedProxyUrl": "http://***:***@proxy.example.com:7890",
+    "revision": 4,
+    "btUseProxy": true,
+    "btRuntimeApply": "applied"
+  },
+  "appliedTaskIds": [1],
+  "deferredTaskIds": [2],
+  "failed": [
+    {
+      "taskId": 3,
+      "code": "runtime_transition",
+      "message": "Aria2 正在切换运行状态，请稍后重试"
+    }
+  ]
+}
+```
+
+非法 URL 返回 `400 proxy_invalid_url`；错误消息只描述校验规则，不回显输入。`failed` 只包含任务 ID、稳定错误码和脱敏消息。
+
+### 4.6 调试日志
+
+| 方法 | 路径 | 响应 |
+| --- | --- | --- |
+| `GET` | `/api/debug-logs` | `DebugLogEntry[]` |
+| `DELETE` | `/api/debug-logs` | `204 No Content` |
+
+`DebugLogEntry` 保留原有字段，并包含用于高级筛选和重复折叠的字段：
+
+```json
+{
+  "id": 1,
+  "timestampMs": 1783670013000,
+  "lastTimestampMs": 1783670013000,
+  "level": "info",
+  "category": "task",
+  "module": "tasks.create",
+  "message": "下载任务已写入内存列表和 SQLite，ID 1，GID abc",
+  "repeatCount": 1
+}
+```
+
+约定：
+
+- `category` 可为 `app`、`task`、`aria2`、`settings`、`storage`、`api`、`runtime`。
+- 应用内调试日志与 `app/data/logs/server.log` 默认只记录关键生命周期、用户操作、状态转换、警告和错误；应用信息、通信检查、设置读取、Aria2 状态、`aria2.getVersion` 和 `aria2.getGlobalOption` 等常规只读成功请求不写文件日志。`server.log` 单文件上限为 10 MiB，保留当前文件和最多 3 个历史文件；fnOS 生命周期脚本和进程标准输出进入同目录的 `lifecycle.log`，默认单文件上限为 1 MiB，也保留最多 3 个历史文件。
+- Aria2 原生日志位于应用数据目录的 `aria2/aria2.log`，与应用内调试日志相互独立。默认只记录 `warn` 及以上事件，单文件上限为 10 MiB，总计最多保留 3 个文件（当前文件和 2 个历史文件）。
+- 文件日志和内存调试日志共用敏感字段脱敏规则：URL 的 query/fragment、JWT、各类 Token、密码、Authorization 和 RPC secret 不写入日志。排障时可用响应头 `X-Request-ID` 将管理 API、SSE 和 JSON-RPC 请求与日志关联。
+- 下载代理 URL、userinfo、兼容私密覆盖、应用配置 revision 与 Aria2 `all-proxy` 值不进入普通操作日志、调试日志或诊断响应；任务相关记录只允许使用 `useProxy` 布尔值。
+- 连续相同级别、模块和消息会折叠为一条，`repeatCount` 记录次数，`lastTimestampMs` 记录最后发生时间。
+
+### 4.7 Aria2 详细日志模式
+
+| 方法 | 路径 | 请求 | 响应 |
+| --- | --- | --- | --- |
+| `GET` | `/api/diagnostics/aria2-log-mode` | - | `Aria2LogModeStatus` |
+| `PUT` | `/api/diagnostics/aria2-log-mode` | `{ "detailed": true }` 或 `{ "detailed": false }` | `Aria2LogModeStatus` |
+
+`Aria2LogModeStatus`：
+
+```json
+{
+  "mode": "debug",
+  "detailed": true,
+  "detailedUntilMs": 1783671813000,
+  "maxFileSizeBytes": 10485760,
+  "maxFileCount": 3,
+  "appliesOnNextStart": false
+}
+```
+
+- 详细模式只允许通过管理 API 且要求有效管理员 JWT 启用。模式固定为 `debug`，30 分钟后自动恢复 `warn`；状态只保存在内存，服务重启后必定恢复普通日志。
+- 已确认运行且处于 `Ready` 的 sidecar 由服务端私有回环 RPC 调用 `aria2.changeGlobalOption` 即时切换；停止时不启动引擎，`appliesOnNextStart=true` 表示将在下一次受控启动时生效。启动或停止转换中返回 `409 aria2_log_mode_conflict`。
+- 外部 JSON-RPC 白名单不包含 `aria2.changeGlobalOption`，也不提供日志模式、日志清理或诊断导出方法。任何模式下单文件大小与保留数量均不放宽。
+
+### 4.8 日志占用、清理与诊断包
+
+| 方法 | 路径 | 请求 | 响应 |
+| --- | --- | --- | --- |
+| `GET` | `/api/diagnostics/logs` | - | `DiagnosticsLogUsage` |
+| `GET` | `/api/diagnostics/storage` | - | `DiagnosticsStorageUsage` |
+| `DELETE` | `/api/diagnostics/aria2-logs` | - | `Aria2LogCleanupResponse` |
+| `GET` | `/api/diagnostics/diagnostic-bundle` | - | `application/zip` attachment |
+
+`DiagnosticsLogUsage` 不返回绝对路径：
+
+```json
+{
+  "aria2": {
+    "currentBytes": 10485760,
+    "historyBytes": 20971520,
+    "totalBytes": 31457280,
+    "currentFileCount": 1,
+    "historyFileCount": 2,
+    "totalFileCount": 3
+  },
+  "server": {
+    "currentBytes": 1024,
+    "historyBytes": 0,
+    "totalBytes": 1024,
+    "currentFileCount": 1,
+    "historyFileCount": 0,
+    "totalFileCount": 1
+  },
+  "lifecycle": {
+    "currentBytes": 0,
+    "historyBytes": 0,
+    "totalBytes": 0,
+    "currentFileCount": 0,
+    "historyFileCount": 0,
+    "totalFileCount": 0
+  },
+  "totalBytes": 31458304,
+  "totalFileCount": 4,
+  "aria2LogMode": {
+    "mode": "warn",
+    "detailed": false,
+    "detailedUntilMs": null,
+    "maxFileSizeBytes": 10485760,
+    "maxFileCount": 3,
+    "appliesOnNextStart": false
+  }
+}
+```
+
+清理成功响应：
+
+```json
+{
+  "reclaimedBytes": 31457280,
+  "usage": {
+    "aria2": {
+      "currentBytes": 0,
+      "historyBytes": 0,
+      "totalBytes": 0,
+      "currentFileCount": 0,
+      "historyFileCount": 0,
+      "totalFileCount": 0
+    },
+    "server": {
+      "currentBytes": 1024,
+      "historyBytes": 0,
+      "totalBytes": 1024,
+      "currentFileCount": 1,
+      "historyFileCount": 0,
+      "totalFileCount": 1
+    },
+    "lifecycle": {
+      "currentBytes": 0,
+      "historyBytes": 0,
+      "totalBytes": 0,
+      "currentFileCount": 0,
+      "historyFileCount": 0,
+      "totalFileCount": 0
+    },
+    "totalBytes": 1024,
+    "totalFileCount": 1,
+    "aria2LogMode": {
+      "mode": "warn",
+      "detailed": false,
+      "detailedUntilMs": null,
+      "maxFileSizeBytes": 10485760,
+      "maxFileCount": 3,
+      "appliesOnNextStart": false
+    }
+  }
+}
+```
+
+约定：
+
+- 本节四个接口都要求有效管理员 JWT，且不注册到任何 JSON-RPC listener。
+- 占用统计只读取应用数据目录内固定的普通文件：Aria2 当前日志及兼容的新旧轮转命名、`logs/server.log(.1-.3)` 和 `logs/lifecycle.log(.1-.3)`。符号链接、未知文件和下载目录均不计入，也不返回应用数据目录的绝对路径。
+- 手动清理只删除应用私有的 `aria2.log` 与已识别的新旧 Aria2 轮转日志，不停止或启动引擎，不删除 SQLite、session、设置、应用日志或用户下载文件。Aria2 运行中、生命周期切换中或进程归属无法确认时返回 `409 aria2_log_in_use`；服务退出中返回 `409 runtime_exiting`。
+- Rust bootstrap 在孤儿进程对账完成后、任何受控 Aria2 启动之前执行同一套安全门禁。确认 sidecar 未使用日志时，超过 10 MiB 的旧 `aria2.log` 只保留最后 10 MiB，并在新旧轮转命名中总计只保留两份历史文件；无法证明安全时跳过并记录警告。
+- 诊断包文件名固定为 `motrix-fnos-diagnostic-bundle.zip`，在内存中生成，不在应用数据目录长期落盘。ZIP 至少包含 `summary.json` 和 `logs/app-debug.jsonl`，并按存在情况加入 `logs/server.log(.1-.3)`、`logs/lifecycle.log(.1-.3)` 及 `logs/aria2/` 下的新旧命名 Aria2 日志尾部。
+- 诊断包生成使用独立并发门禁，同一时间只处理一个导出请求；已有导出任务运行时返回 `429 diagnostic_bundle_busy` 和 `Retry-After: 1`。
+- 诊断包总未压缩输入预算为 16 MiB；Aria2、server、lifecycle 分组预算分别为 10 MiB、4 MiB、2 MiB，应用内调试记录最多 512 KiB，摘要最多 64 KiB。所有文本逐行复用服务端脱敏规则并优先保留最新尾部。
+- 诊断包不包含 SQLite、Aria2 session、运行态 JSON、设置原文、密码、JWT 或其他 Token；只读取固定目录内普通文件并拒绝符号链接。
+- 登录诊断包文件名固定为 `motrix-fnos-login-diagnostic.zip`，只包含 `summary.json`、`logs/auth-debug.jsonl` 和存在时的 `logs/lifecycle.log(.1-.3)`；它用于登录页排障，不需要先登录，也不包含完整诊断包中的 server/Aria2 日志。
+- `DELETE /api/debug-logs` 仅清空应用内调试记录，不会释放 Aria2、server 或 lifecycle 文件日志空间。
+
+`GET /api/diagnostics/storage` 返回应用数据所在文件系统的空间及私有 session、metadata 和原生状态占用，不返回任何绝对路径：
+
+```json
+{
+  "disk": {
+    "totalBytes": 107374182400,
+    "availableBytes": 53687091200
+  },
+  "aria2SessionBytes": 4096,
+  "magnetMetadata": {
+    "totalBytes": 8192,
+    "fileCount": 2
+  },
+  "nativeState": {
+    "totalBytes": 16384,
+    "fileCount": 3
+  }
+}
+```
+
+约定：
+
+- 接口要求有效管理员 JWT，且不注册到任何 JSON-RPC listener。
+- `disk` 使用应用数据目录所在文件系统的总空间和可用空间；`aria2SessionBytes` 合计旧 `aria2/aria2.session` 和新 `engine/native-v2/session/aria2.session`；`magnetMetadata` 合计私有 `magnet-metadata` 与 `task-metadata` 普通文件；`nativeState` 统计 `engine/native-v2/state` 的原生状态文件（含 WAL）。这些恢复信息只统计占用，不作为可清理临时文件或导出内容。
+- 缺失的 session 或 metadata 目录返回零值。符号链接、非普通文件和非普通目录不会被跟随或计入；不会扫描用户下载目录。
+- 读取应用数据目录或文件系统空间失败时返回 `500 diagnostics_storage_usage_failed`，响应不包含服务端绝对路径。
+
+### 4.9 存储目录
+
+| 方法 | 路径 | 响应 |
+| --- | --- | --- |
+| `GET` | `/api/storage/accessible-paths` | `AccessiblePathsResponse` |
+| `GET` | `/api/storage/accessible-paths/display?language=zh-CN` | `DisplayAccessiblePathsResponse` |
+| `POST` | `/api/storage/accessible-paths/refresh` | `AccessiblePathsResponse` |
+
+`AccessiblePathsResponse`：
+
+```json
+{
+  "paths": ["/vol1/downloads", "/vol1/media"]
+}
+```
+
+`DisplayAccessiblePathsResponse`：
+
+```json
+{
+  "paths": [
+    {
+      "path": "/vol1/1000/downloads",
+      "displayPath": "存储空间1/admin 的文件/downloads"
+    }
+  ]
+}
+```
+
+约定：
+
+- `GET` 只读取当前已确认快照，响应结构保持兼容，不调用 fnOS 外部服务。
+- `GET /display` 只转换当前授权快照中的路径，不接受客户端路径。`language` 只接受 `zh-CN` 或 `en-US`；缺失时按 `zh-CN`，非法值返回 `400 display_language_invalid`。
+- server 通过 `trim.file.convertPath` 请求语义化路径。上游失败或 Token/Socket 不可用时整批回退原始路径；上游缺项、重复项或空语义路径时只对相应原始路径回退。结果按原始路径精确匹配，不持久化、不缓存。
+- `POST` 无请求体，要求有效管理员 JWT；server 使用 `TRIM_API_TOKEN` 通过官方 Unix Socket 查询 `trim.file.getSharedAccessibleFolders`。
+- 官方查询成功后校验全部路径并原子覆盖快照；空数组是有效结果。查询、响应校验或持久化失败时不修改旧快照。
+- 官方路径必须是非根绝对 Unix 路径，允许路径内部的普通空格和 Unicode 空格并原样保留；不允许首尾空白、控制字符（含 NUL、换行和制表符）、反斜杠、`.` 或 `..` 组件。任一非法项拒绝整次刷新；合法路径去重并保留官方顺序。平台依据与验证边界见 [维护手册](maintenance.md#平台依据与未验证边界)。
+- 上游失败映射为 `502` 或 `503`，不得映射为浏览器 `401`。成功刷新后同步更新 JSON-RPC 默认下载目录缓存。
+- 前端新建任务时必须从 `paths` 中选择保存目录；列表为空或宿主不支持 SDK 时，应提示用户在符合版本要求的 fnOS 宿主中打开 Motrix 完成读写文件夹授权。
+
+## 5. SSE 事件流
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/events` | 订阅运行时事件流 |
+
+约定：
+
+- 格式使用标准 SSE。
+- 连接建立后依次推送 `app.compatibility` 和 `tasks.snapshot`；广播丢帧后也用这两份完整快照恢复基线。
+- 可见任务列表发生变化时推送 `tasks.snapshot`。
+- 服务进入退出流程时推送 `runtime.exiting`。
+- 当前事件模型使用整包快照，不使用增量 diff。
+- JWT 失效时连接终止；重新订阅未携带有效 JWT 时返回 `401 Unauthorized`，不会发送任务快照。
+- 已建立的连接每 15 秒及收到广播事件后重新校验鉴权，校验失败即结束事件流；空闲时每 15 秒发送一次 `keepalive` 注释，不作为业务事件。
+
+`app.compatibility` 的数据结构与 `/api/app/compatibility` 返回的 `AppCompatibility` 相同，用于同步引擎代际和受限管理状态。
+
+`tasks.snapshot`：
+
+```json
+{
+  "revision": 1,
+  "tasks": []
+}
+```
+
+`runtime.exiting`：
+
+```json
+{
+  "reason": "收到停止信号",
+  "timestamp": 1760000000000
+}
+```
+
+## 6. JSON-RPC 兼容入口
+
+`/jsonrpc` 是为解析站、浏览器扩展或外部工具提供的 Aria2 JSON-RPC 兼容入口，不属于 Web UI 的主通信路径。公网反代入口注册在 `127.0.0.1:17081`，局域网入口注册在 `0.0.0.0:17082`；Web UI 仍通过管理监听器的 `/api/*` 和 `/api/events` 工作。
+
+不兼容变更：JSON-RPC 客户端必须迁移到指向回环专用监听器的反向代理；Web 管理密码必须在安装向导中设置。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/jsonrpc` | 接收 JSON-RPC 2.0 请求或批量请求 |
+| `GET` | `/jsonrpc` | WebSocket JSON-RPC；支持 `jsonrpc` 子协议 |
+| `OPTIONS` | `/jsonrpc` | 预检请求，返回跨域所需响应头 |
+
+支持方法：
+
+| JSON-RPC 方法 | 鉴权 | 说明 |
+| --- | --- | --- |
+| `aria2.addUri` | 需要 `jsonRpcToken` | 添加 HTTP/HTTPS 或磁力链接下载任务，成功返回 Aria2 GID |
+| `aria2.getGlobalOption` | 需要 `jsonRpcToken` | 从内存返回安全兼容子集，目前只包含已授权默认下载目录 `dir`；没有可用授权目录时返回空字符串，不启动或探测 Aria2，不返回 RPC secret、代理凭据等敏感配置 |
+| `aria2.getVersion` | 不需要 | 运行时返回版本与空 `enabledFeatures` 并更新进程内版本缓存；已停止时不启动 Aria2、不访问磁盘，返回最后一次读取到的版本，尚无缓存时返回 `unknown`；正在停止时返回 `-32004` 和 `Aria2 正在停止，请稍后重试` |
+| `system.multicall` | 子调用按方法校验 | 批量执行；其中每个需要鉴权的子调用都必须在自身参数中携带有效 token |
+
+鉴权约定：
+
+- `jsonRpcToken` 通过 `/api/settings/jsonrpc-token` 专用接口更新，不是 Web 管理密码或 Aria2 RPC Secret，也不会暴露后端内部 Aria2 secret。
+- `lanJsonRpcToken` 由 `/api/settings/lan-jsonrpc` 首次启用时生成，或通过 `/api/settings/lan-jsonrpc/token` 轮换；它只在 `17082` 有效，公网 Token 只在 `17081` 有效。
+- 两类 Token 在服务启动时加载到内存，设置成功后同步更新；所有鉴权方法都使用常量时间比较，请求过程中不得读取 SQLite。
+- `aria2.addUri` 的第一个参数必须是 `"token:<jsonRpcToken>"`；token 缺失、错误或未配置会返回 JSON-RPC error。
+- HTTP `aria2.addUri` 选项中的旧 `all-proxy` 继续生效，其最终值只进入任务私密覆盖记录；任务响应、SSE 和日志仅暴露 `useProxy=true`。没有 `all-proxy` 的外部创建按 `useProxy=false` 保存。代理值校验失败返回 JSON-RPC `-32602`，不得创建 GID 或任务记录。
+- `aria2.getGlobalOption` 同样要求第一个参数为 `"token:<jsonRpcToken>"`；目录与 Token 在服务启动时加载到内存，并在管理设置保存成功后同步更新，因此重复查询不会读取 SQLite、授权目录文件或唤醒 Aria2。应用数据根目录不会作为外部下载目录返回；没有可用授权目录时 `dir` 为 `""`，发送端应按未指定目录处理。
+- fnOS 在服务运行期间调整授权目录时，外部发送端可能短暂携带上一次查询到的旧默认目录；`aria2.addUri` 仅在该值确实等于服务端曾返回的缓存默认目录时改用当前授权默认目录并刷新缓存。其他未授权目录仍返回 `-32602`。
+- `aria2.getVersion` 保持匿名可用；HTTP、WebSocket 和 `system.multicall` 在已停止时使用相同的只读兼容结果，在正在停止时使用相同的 `-32004` 错误。
+- `system.multicall` 外层 token 会被忽略；每个 `aria2.addUri` 或 `aria2.getGlobalOption` 子调用仍需在自身 `params` 中携带 token。
+
+`aria2.addUri` 示例：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "add-1",
+  "method": "aria2.addUri",
+  "params": [
+    "token:your-json-rpc-token",
+    ["https://example.com/file.zip"],
+    {
+      "dir": "/vol1/downloads",
+      "out": "file.zip",
+      "stream-max-connections": "8"
+    }
+  ]
+}
+```
+
+约定：
+
+- `dir` 必须是 `/api/storage/accessible-paths` 返回的授权目录本身或其子目录；未传 `dir` 时使用后端默认下载目录，并同样要求该目录已授权。
+- 为兼容会删除 Unix 路径首个 `/` 的第三方发送页，JSON-RPC 仅在请求值不含空组件、`.`、`..` 或反斜杠，且补回一个 `/` 后仍位于授权目录本身或其子目录时接受该值。server 逐级拒绝符号链接或同名文件，并在 Aria2 创建任务前创建缺失子目录。
+- `out` 会映射为 Motrix 任务文件名。
+- 当 URL 为 `magnet:?` 时，`dir` 表示授权父目录；后端在私有目录解析 metadata 并保持同一 GID，用户在 Web UI 确认文件后才设置任务专属子目录并开始实际下载。BT 任务级代理选项返回 `-32602`，须使用设置页总开关。
+- 远程入口只支持 HTTP / HTTPS URL 和 `magnet:?`，不支持上传种子文件；种子文件使用 Web UI 或 `/api/tasks/torrent`。
+- HTTP 连接统一用 `stream-max-connections`（`1..=64`），兼容旧 `split` / `max-connection-per-server` 并取较小值，新旧混用拒绝。`min-split-size`、`bt-save-metadata`、`dht-file-path` 等废弃选项及 `rpc-*`、`state-dir`、session、日志等服务管理选项明确返回 `-32602`；其他非白名单选项按既有规则忽略。
+- 普通 HTTP/HTTPS URL 始终下载原文件，不自动进入 HLS/DASH 媒体处理；只允许 `media=file`。
+- 不支持的方法返回 `-32601 Method not found`；参数错误返回 `-32602 Invalid params`；服务侧错误返回 `-32000`；token 错误返回 `-32001`，token 未配置返回 `-32002`；Aria2 正在停止时返回 `-32004`；兼容门禁禁止下载时返回 `-32005`。
+- 不要在公开网页、前端仓库或日志中记录 `jsonRpcToken`；公网反向代理只能指向回环 RPC 专用监听器的 `/jsonrpc`，根路径、`/api/*`、SSE 和静态资源在该监听器上必须保持 404。
+- 局域网入口的关闭响应与来源策略见[运行时约定](#1-运行时约定)，配置字段见[设置接口](#45-设置)。配置关闭或收紧来源范围后，已有 WebSocket 连接也会被策略关闭；它不支持 IPv6、链路本地、回环或通过代理 Header 扩展来源范围。
+- 回环和局域网 JSON-RPC WebSocket 共享 64 个连接配额；达到上限的新握手返回 `503 Service Unavailable`。连接连续 5 分钟没有文本或二进制业务消息会关闭，Ping/Pong 不延长该期限；发送响应超过 10 秒也关闭连接并释放配额。

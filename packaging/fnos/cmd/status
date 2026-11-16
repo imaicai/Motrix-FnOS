@@ -1,0 +1,18 @@
+#!/bin/sh
+
+set -eu
+
+. "$(dirname -- "$0")/common.sh"
+
+pid=$(read_pid || true)
+if [ -n "${pid}" ] && is_managed_server_instance "${pid}"; then
+  if readiness_request; then
+    ui_message "motrix-fnos-server 运行中且服务就绪，PID ${pid}" "motrix-fnos-server is running and ready, PID ${pid}"
+    exit 0
+  fi
+  ui_message "motrix-fnos-server 进程运行但服务未就绪，PID ${pid}" "motrix-fnos-server is running but not ready, PID ${pid}" >&2
+  exit 1
+fi
+
+ui_message "motrix-fnos-server 未运行" "motrix-fnos-server is not running"
+exit 3

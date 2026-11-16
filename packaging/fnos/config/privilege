@@ -1,0 +1,7 @@
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "username": "motrix_fnos",
+  "groupname": "motrix_fnos"
+}

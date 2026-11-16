@@ -1,0 +1,247 @@
+import { defineStore } from "pinia";
+import { computed, ref } from "vue";
+import { useDebugLogStore } from "../../diagnostics/stores/debugLogStore";
+import { useSettingsStore } from "../../settings/stores/settingsStore";
+import { useTaskStore } from "../../tasks/stores/taskStore";
+import { useJsonRpcTokenStore } from "../../settings/stores/jsonRpcTokenStore";
+import { setAccessTokenProvider, setUnauthorizedHandler } from "../../../services/http";
+import { createAuthChannel, type AuthChannel } from "../services/authChannel";
+import {
+  changeAuthPassword,
+  getAuthStatus,
+  loginAuth,
+  logoutAuth,
+} from "../services/authService";
+import type { AuthChannelMessage, AuthPhase, AuthStatus, ChangePasswordRequest } from "../types";
+import { t } from "../../../i18n";
+import { getErrorMessage } from "../../../app/utils/errors";
+
+const ACCESS_TOKEN_STORAGE_KEY = "motrix-fnos:web-access-token";
+
+export const useAuthStore = defineStore("auth", () => {
+  const phase = ref<AuthPhase>("loading");
+  const authenticated = ref(false);
+  const accessToken = ref<string | null>(null);
+  const localStorageAvailable = ref(true);
+  const errorMessage = ref("");
+  const isSubmitting = ref(false);
+  let channel: AuthChannel | null = null;
+  let authGeneration = 0;
+
+  const isReady = computed(() => phase.value === "ready");
+  const hasAccessToken = computed(() => Boolean(accessToken.value));
+
+  function getAccessToken() {
+    return accessToken.value;
+  }
+
+  async function initialize() {
+    phase.value = "loading";
+    errorMessage.value = "";
+    restoreAccessToken();
+    try {
+      applyStatus(await getAuthStatus());
+    } catch (error) {
+      clearAuthState();
+      phase.value = "error";
+      errorMessage.value = getErrorMessage(error, t("auth.loadFailed"));
+      throw error;
+    }
+  }
+
+  async function refreshStatus() {
+    const status = await getAuthStatus();
+    applyStatus(status);
+    return status;
+  }
+
+  async function login(password: string) {
+    return submit(() => loginAuth(password), true);
+  }
+
+  async function logout() {
+    isSubmitting.value = true;
+    try {
+      await logoutAuth();
+    } finally {
+      lockToLogin();
+      channel?.post({ type: "auth-invalidated" });
+      isSubmitting.value = false;
+    }
+  }
+
+  async function changePassword(payload: ChangePasswordRequest) {
+    return submit(() => changeAuthPassword(payload), true);
+  }
+
+  async function handleUnauthorized(expectedToken: string | null = accessToken.value) {
+    if (expectedToken !== accessToken.value) return;
+    clearSensitiveState();
+    clearAccessToken();
+    const recoveryGeneration = authGeneration;
+    try {
+      const status = await getAuthStatus();
+      if (authGeneration !== recoveryGeneration) return;
+      applyStatus(status);
+    } catch {
+      if (authGeneration !== recoveryGeneration) return;
+      phase.value = "login";
+    }
+    if (authGeneration !== recoveryGeneration) return;
+    channel?.post({ type: "auth-invalidated" });
+  }
+
+  function handleUnauthorizedStatus(status: AuthStatus) {
+    if (!status.authenticated) {
+      clearAccessToken();
+    }
+    applyStatus(status);
+    if (!isReady.value) {
+      clearSensitiveState();
+      channel?.post({ type: "auth-invalidated" });
+    }
+  }
+
+  function startCoordination() {
+    setAccessTokenProvider(() => accessToken.value);
+    setUnauthorizedHandler(handleUnauthorized);
+    channel ??= createAuthChannel(handleChannelMessage);
+  }
+
+  function stopCoordination() {
+    setAccessTokenProvider(null);
+    setUnauthorizedHandler(null);
+    channel?.close();
+    channel = null;
+  }
+
+  async function submit(operation: () => Promise<AuthStatus>, verifyToken: boolean) {
+    isSubmitting.value = true;
+    errorMessage.value = "";
+    try {
+      const response = await operation();
+      if (response.accessToken) {
+        saveAccessToken(response.accessToken);
+      }
+      let status = response;
+      if (verifyToken) {
+        try {
+          status = await getAuthStatus();
+        } catch (error) {
+          lockToLogin();
+          throw error;
+        }
+        if (!status.authenticated) {
+          lockToLogin();
+          throw new Error(t("auth.tokenVerificationFailed"));
+        }
+      }
+      applyStatus(status);
+      channel?.post({ type: "auth-updated" });
+      return status;
+    } finally {
+      isSubmitting.value = false;
+    }
+  }
+
+  async function handleChannelMessage(message: AuthChannelMessage) {
+    if (message.type === "auth-invalidated") {
+      lockToLogin();
+      return;
+    }
+    try {
+      await refreshStatus();
+    } catch {
+      lockToLogin();
+    }
+  }
+
+  function applyStatus(status: AuthStatus) {
+    const wasReady = isReady.value;
+    authenticated.value = status.authenticated;
+    errorMessage.value = "";
+    if (status.setupRequired) {
+      phase.value = "unconfigured";
+      authenticated.value = false;
+      clearAccessToken();
+    } else if (!status.authenticated) {
+      phase.value = "login";
+      clearAccessToken();
+    } else {
+      phase.value = "ready";
+    }
+    if (wasReady && phase.value !== "ready") {
+      clearSensitiveState();
+    }
+  }
+
+  function lockToLogin() {
+    clearSensitiveState();
+    clearAuthState();
+    clearAccessToken();
+    phase.value = "login";
+  }
+
+  function clearAuthState() {
+    authenticated.value = false;
+  }
+
+  function clearSensitiveState() {
+    useTaskStore().clearSensitiveState();
+    useSettingsStore().clearSensitiveState();
+    useJsonRpcTokenStore().clearSensitiveState();
+    useDebugLogStore().clearSensitiveState();
+  }
+
+  function restoreAccessToken() {
+    try {
+      accessToken.value = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
+      localStorageAvailable.value = true;
+    } catch {
+      accessToken.value = null;
+      localStorageAvailable.value = false;
+    }
+  }
+
+  function saveAccessToken(token: string) {
+    accessToken.value = token;
+    authGeneration += 1;
+    try {
+      window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token);
+      localStorageAvailable.value = true;
+    } catch {
+      localStorageAvailable.value = false;
+    }
+  }
+
+  function clearAccessToken() {
+    accessToken.value = null;
+    authGeneration += 1;
+    try {
+      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+    } catch {
+      localStorageAvailable.value = false;
+    }
+  }
+
+  return {
+    phase,
+    authenticated,
+    accessToken,
+    hasAccessToken,
+    getAccessToken,
+    localStorageAvailable,
+    errorMessage,
+    isSubmitting,
+    isReady,
+    initialize,
+    refreshStatus,
+    login,
+    logout,
+    changePassword,
+    handleUnauthorized,
+    handleUnauthorizedStatus,
+    startCoordination,
+    stopCoordination,
+  };
+});

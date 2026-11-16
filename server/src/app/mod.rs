@@ -1,0 +1,1271 @@
+use crate::aria2::{Aria2LogModeCoordinator, Aria2RpcClient};
+use crate::auth::{AuthRuntime, AuthService, ServerProcessLock};
+use crate::config::aria2::{Aria2Config, ARIA2_PATH_ENV};
+use crate::database::{
+    backup_database, check_integrity, connect_database,
+    maintenance::cleanup_history,
+    tasks::{list_download_tasks_for_engine, max_download_task_id},
+    DATABASE_FILE_NAME,
+};
+use crate::fnos::FnosApiClient;
+use crate::runtime::{Aria2LifecycleCoordinator, ManagedAria2Process};
+use crate::settings::service::{
+    load_app_config_from_pool, load_json_rpc_token, load_lan_json_rpc_config, AppConfig,
+    LanJsonRpcConfig,
+};
+use crate::state::{Aria2RuntimeInfo, ServerState};
+use crate::storage::{
+    default_download_dir, load_accessible_paths, refresh_accessible_paths_from_fnos,
+    AccessiblePathsRefreshError,
+};
+use crate::tasks::repository::SqliteTaskRepository;
+use crate::tasks::service::{RuntimeGuard, TaskService, TaskServiceDependencies};
+use crate::tasks::{DownloadTask, PublicDownloadTask};
+use serde::Serialize;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::env;
+use std::future::{Future, IntoFuture};
+use std::io::{BufRead, IsTerminal, Read, Write};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, watch, RwLock, Semaphore};
+use tokio::time::{timeout_at, Duration, Instant};
+
+pub const APP_DATA_DIR_ENV: &str = "MOTRIX_FNOS_APP_DATA_DIR";
+pub const HTTP_ADDR_ENV: &str = "MOTRIX_FNOS_HTTP_ADDR";
+pub const JSONRPC_ADDR_ENV: &str = "MOTRIX_FNOS_JSONRPC_ADDR";
+pub const LAN_JSONRPC_ADDR_ENV: &str = "MOTRIX_FNOS_LAN_JSONRPC_ADDR";
+pub const ACCESSIBLE_PATHS_FILE_ENV: &str = "MOTRIX_FNOS_ACCESSIBLE_PATHS_FILE";
+pub const TRUSTED_PROXY_IPS_ENV: &str = "MOTRIX_TRUSTED_PROXY_IPS";
+pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:17080";
+pub const DEFAULT_JSONRPC_ADDR: &str = "127.0.0.1:17081";
+pub const DEFAULT_LAN_JSONRPC_ADDR: &str = "0.0.0.0:17082";
+pub const ACCESSIBLE_PATHS_FILE_NAME: &str = "accessible-paths.json";
+pub const JSONRPC_WEBSOCKET_CONNECTION_LIMIT: usize = 64;
+const RUNTIME_EVENT_BUFFER: usize = 32;
+
+pub mod compatibility;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRuntimeConfig {
+    pub app_data_dir: PathBuf,
+    pub database_path: PathBuf,
+    pub http_addr: SocketAddr,
+    pub jsonrpc_addr: SocketAddr,
+    pub lan_jsonrpc_addr: SocketAddr,
+    pub aria2_path: Option<PathBuf>,
+    pub accessible_paths_path: PathBuf,
+    pub trusted_proxy_ips: Vec<IpAddr>,
+}
+
+impl ServerRuntimeConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let app_data_dir = env::var(APP_DATA_DIR_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_local_app_data_dir);
+        let http_addr = env::var(HTTP_ADDR_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string())
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("解析管理监听地址失败：{}", error))?;
+        let jsonrpc_addr = env::var(JSONRPC_ADDR_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_JSONRPC_ADDR.to_string())
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("解析 JSON-RPC 监听地址失败：{}", error))?;
+        if !jsonrpc_addr.ip().is_loopback() {
+            return Err(format!(
+                "JSON-RPC 监听地址必须使用回环 IP：{}",
+                jsonrpc_addr
+            ));
+        }
+        let lan_jsonrpc_addr = env::var(LAN_JSONRPC_ADDR_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_LAN_JSONRPC_ADDR.to_string())
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("解析局域网 JSON-RPC 监听地址失败：{}", error))?;
+        let aria2_path = env::var(ARIA2_PATH_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        let database_path = app_data_dir.join(DATABASE_FILE_NAME);
+        let accessible_paths_path = env::var(ACCESSIBLE_PATHS_FILE_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| app_data_dir.join(ACCESSIBLE_PATHS_FILE_NAME));
+        let trusted_proxy_ips = parse_trusted_proxy_ips()?;
+        Ok(Self {
+            app_data_dir,
+            database_path,
+            http_addr,
+            jsonrpc_addr,
+            lan_jsonrpc_addr,
+            aria2_path,
+            accessible_paths_path,
+            trusted_proxy_ips,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeExitingPayload {
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TasksSnapshotPayload {
+    pub revision: u64,
+    pub tasks: Vec<PublicDownloadTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeEvent {
+    AppCompatibility(compatibility::AppCompatibility),
+    TasksSnapshot(TasksSnapshotPayload),
+    RuntimeExiting(RuntimeExitingPayload),
+}
+
+#[derive(Clone)]
+pub struct RuntimeEventHub {
+    sender: broadcast::Sender<RuntimeEvent>,
+}
+
+impl RuntimeEventHub {
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(RUNTIME_EVENT_BUFFER);
+        Self { sender }
+    }
+
+    pub fn send(&self, event: RuntimeEvent) -> Result<usize, String> {
+        match self.sender.send(event) {
+            Ok(count) => Ok(count),
+            // 没有前端订阅者只表示当前无需投递事件，不能因此把正常的后台任务流程判为失败。
+            Err(_) => Ok(0),
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+        self.sender.subscribe()
+    }
+}
+
+impl Default for RuntimeEventHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct HttpAppState {
+    pub(crate) compatibility: Mutex<compatibility::AppCompatibility>,
+    pub core: Arc<ServerState>,
+    pub auth: AuthRuntime,
+    pub runtime: ServerRuntimeConfig,
+    pub base_aria2_config: Aria2Config,
+    pub aria2_rpc: Aria2RpcClient,
+    pub aria2_process: Mutex<Option<ManagedAria2Process>>,
+    pub aria2_lifecycle: Arc<Aria2LifecycleCoordinator>,
+    pub aria2_log_mode: Aria2LogModeCoordinator,
+    pub runtime_events: RuntimeEventHub,
+    pub(crate) tasks_snapshot_revision: Mutex<u64>,
+    last_aria2_version: Mutex<Option<String>>,
+    json_rpc_default_download_dir: Mutex<String>,
+    json_rpc_token: Mutex<String>,
+    app_config: RwLock<AppConfig>,
+    pub(crate) lan_json_rpc_config: RwLock<LanJsonRpcConfig>,
+    lan_json_rpc_config_revision: watch::Sender<u64>,
+    pub(crate) jsonrpc_websocket_connections: Arc<Semaphore>,
+    pub(crate) download_proxy_update_lock: tokio::sync::Mutex<()>,
+    pub(crate) settings_update_lock: tokio::sync::Mutex<()>,
+    accessible_paths_refresh_lock: tokio::sync::Mutex<()>,
+    fnos_api_client: Mutex<FnosApiClient>,
+    listeners_ready: AtomicBool,
+    lan_jsonrpc_port_in_use: AtomicBool,
+    file_cleanup_worker_running: AtomicBool,
+    file_cleanup_worker_notify: tokio::sync::Notify,
+}
+
+impl HttpAppState {
+    pub(crate) fn task_service(&self) -> TaskService<'_> {
+        TaskService::new(TaskServiceDependencies {
+            repository: Box::new(SqliteTaskRepository::for_engine(
+                &self.core.database.pool,
+                crate::config::aria2::EngineGeneration::NativeV2,
+            )),
+            download_tasks: &self.core.download_tasks,
+            next_task_id: &self.core.next_task_id,
+            app_data_dir: &self.core.app_data_dir,
+            accessible_paths_path: &self.runtime.accessible_paths_path,
+            debug_logs: &self.core.debug_logs,
+            aria2_rpc: &self.aria2_rpc,
+            aria2_lifecycle: &self.aria2_lifecycle,
+            proxy_update_lock: &self.download_proxy_update_lock,
+            runtime_guard: RuntimeGuard::with_compatibility(
+                &self.core.shutdown,
+                &self.compatibility,
+            ),
+        })
+    }
+
+    pub fn new(core: ServerState, runtime: ServerRuntimeConfig) -> Self {
+        let (lan_json_rpc_config_revision, _) = watch::channel(0);
+        let mut base_aria2_config = Aria2Config::from_env();
+        base_aria2_config.aria2_path = runtime
+            .aria2_path
+            .as_ref()
+            .map(|path| path.display().to_string());
+
+        let auth = AuthRuntime::new(core.database.pool.clone());
+        let aria2_lifecycle = Arc::new(Aria2LifecycleCoordinator::default());
+        Self {
+            compatibility: Mutex::new(compatibility::AppCompatibility::restricted(
+                crate::config::aria2::EngineGeneration::Unknown,
+                "engine_unknown",
+            )),
+            core: Arc::new(core),
+            auth,
+            runtime,
+            base_aria2_config,
+            aria2_rpc: Aria2RpcClient::with_lifecycle(Arc::clone(&aria2_lifecycle)),
+            aria2_process: Mutex::new(None),
+            aria2_lifecycle,
+            aria2_log_mode: Aria2LogModeCoordinator::default(),
+            runtime_events: RuntimeEventHub::new(),
+            tasks_snapshot_revision: Mutex::new(0),
+            last_aria2_version: Mutex::new(None),
+            json_rpc_default_download_dir: Mutex::new(String::new()),
+            json_rpc_token: Mutex::new(String::new()),
+            app_config: RwLock::new(AppConfig::default()),
+            lan_json_rpc_config: RwLock::new(LanJsonRpcConfig::default()),
+            lan_json_rpc_config_revision,
+            jsonrpc_websocket_connections: Arc::new(Semaphore::new(
+                JSONRPC_WEBSOCKET_CONNECTION_LIMIT,
+            )),
+            download_proxy_update_lock: tokio::sync::Mutex::new(()),
+            settings_update_lock: tokio::sync::Mutex::new(()),
+            accessible_paths_refresh_lock: tokio::sync::Mutex::new(()),
+            fnos_api_client: Mutex::new(FnosApiClient::default()),
+            listeners_ready: AtomicBool::new(false),
+            lan_jsonrpc_port_in_use: AtomicBool::new(false),
+            file_cleanup_worker_running: AtomicBool::new(false),
+            file_cleanup_worker_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn remember_aria2_version(&self, version: &str) {
+        let version = version.trim();
+        if version.is_empty() {
+            return;
+        }
+        *self
+            .last_aria2_version
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(version.to_string());
+    }
+
+    pub(crate) fn last_aria2_version(&self) -> Option<String> {
+        self.last_aria2_version
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn remember_json_rpc_default_download_dir(&self, default_download_dir: &str) {
+        let default_download_dir = default_download_dir.trim();
+        *self
+            .json_rpc_default_download_dir
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = default_download_dir.to_string();
+    }
+
+    pub(crate) fn refresh_json_rpc_default_download_dir(
+        &self,
+        preferred_download_dir: &str,
+        accessible_paths: &[String],
+    ) {
+        let preferred_download_dir = preferred_download_dir.trim();
+        let selected = accessible_paths
+            .iter()
+            .find(|path| path.as_str() == preferred_download_dir)
+            .cloned()
+            .or_else(|| {
+                (!accessible_paths.is_empty()).then(|| {
+                    default_download_dir(accessible_paths, &self.runtime.app_data_dir)
+                        .display()
+                        .to_string()
+                })
+            })
+            .unwrap_or_default();
+        self.remember_json_rpc_default_download_dir(&selected);
+    }
+
+    pub(crate) fn json_rpc_default_download_dir(&self) -> String {
+        self.json_rpc_default_download_dir
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) async fn refresh_accessible_paths_from_fnos(
+        &self,
+    ) -> Result<Vec<String>, AccessiblePathsRefreshError> {
+        let _refresh = self.accessible_paths_refresh_lock.lock().await;
+        let client = self
+            .fnos_api_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let result =
+            refresh_accessible_paths_from_fnos(&client, &self.runtime.accessible_paths_path).await;
+        match result {
+            Ok(result) => {
+                let preferred = self.json_rpc_default_download_dir();
+                self.refresh_json_rpc_default_download_dir(&preferred, &result.paths);
+                self.core.debug_logs.info(
+                    "storage.accessible-paths",
+                    format!(
+                        "已刷新 fnOS 共享授权目录：{} 个（HTTP {}，业务码 {}）",
+                        result.paths.len(),
+                        result.http_status,
+                        result.business_code
+                    ),
+                );
+                Ok(result.paths)
+            }
+            Err(error) => {
+                self.core.debug_logs.warn(
+                    "storage.accessible-paths",
+                    format!("刷新 fnOS 共享授权目录失败，保留旧快照：{error}"),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn display_paths(
+        &self,
+        paths: &[String],
+        language: crate::fnos::PathLanguage,
+    ) -> Vec<crate::storage::DisplayPath> {
+        let client = self
+            .fnos_api_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        crate::storage::display_paths(&client, paths, language).await
+    }
+
+    pub(crate) fn remember_json_rpc_token(&self, token: &str) {
+        *self
+            .json_rpc_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = token.trim().to_string();
+    }
+
+    pub(crate) fn json_rpc_token(&self) -> String {
+        self.json_rpc_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) async fn lan_json_rpc_config(&self) -> LanJsonRpcConfig {
+        self.lan_json_rpc_config.read().await.clone()
+    }
+
+    pub(crate) fn subscribe_lan_json_rpc_config(&self) -> watch::Receiver<u64> {
+        self.lan_json_rpc_config_revision.subscribe()
+    }
+
+    pub(crate) fn lan_jsonrpc_available(&self) -> bool {
+        !self.lan_jsonrpc_port_in_use.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn notify_lan_json_rpc_config_changed(&self) {
+        self.lan_json_rpc_config_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    pub(crate) async fn current_app_config(&self) -> AppConfig {
+        self.app_config.read().await.clone()
+    }
+
+    pub(crate) async fn set_app_config(&self, config: AppConfig) {
+        *self.app_config.write().await = config;
+    }
+
+    pub fn aria2_runtime_snapshot(&self) -> Option<Aria2RuntimeInfo> {
+        self.core.aria2_runtime_snapshot()
+    }
+
+    pub fn aria2_config(&self) -> Aria2Config {
+        let mut config = self.base_aria2_config.clone();
+        let paths = crate::state::native_aria2_runtime_paths(&self.runtime.app_data_dir);
+        config.state_dir = Some(paths.state_dir.display().to_string());
+        config.session_path = Some(paths.session_path.display().to_string());
+        if let Some(runtime) = self.aria2_runtime_snapshot() {
+            config.rpc_port = runtime.actual_port;
+            config.rpc_secret = runtime.rpc_secret;
+            config.log_path = runtime.aria2_log_path.clone();
+        }
+        config
+    }
+
+    pub fn compatibility_snapshot(&self) -> compatibility::AppCompatibility {
+        self.compatibility
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn ensure_download_available(&self) -> Result<(), String> {
+        self.compatibility_snapshot().ensure_download_available()
+    }
+
+    pub(crate) fn public_task(&self, task: DownloadTask) -> PublicDownloadTask {
+        let mut public: PublicDownloadTask = task.into();
+        public.read_only = self.compatibility_snapshot().mode == "restricted"
+            || public.engine_generation == crate::config::aria2::EngineGeneration::Unknown
+            || public.engine_generation != self.compatibility_snapshot().engine_generation;
+        public
+    }
+
+    pub fn with_aria2_runtime_paths(&self, config: Aria2Config) -> Result<Aria2Config, String> {
+        self.core.with_aria2_runtime_paths(config)
+    }
+
+    pub fn build_aria2_runtime_info(
+        &self,
+        pid: u32,
+        config: &Aria2Config,
+        source: crate::config::aria2::Aria2BinarySource,
+        launch_args: Vec<String>,
+    ) -> Aria2RuntimeInfo {
+        self.core
+            .build_aria2_runtime_info(pid, config, source, launch_args)
+    }
+
+    pub fn set_aria2_runtime(&self, runtime: Aria2RuntimeInfo) -> Result<(), String> {
+        self.core.set_aria2_runtime(runtime)
+    }
+
+    pub fn clear_aria2_runtime(&self) -> Result<(), String> {
+        self.core.clear_aria2_runtime()
+    }
+
+    pub fn load_saved_aria2_runtime(&self) -> Result<Option<Aria2RuntimeInfo>, String> {
+        self.core.load_saved_aria2_runtime()
+    }
+
+    pub fn mark_listeners_ready(&self) {
+        self.listeners_ready.store(true, Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.listeners_ready.load(Ordering::Acquire) && !self.core.shutdown.is_exiting()
+    }
+
+    pub fn request_shutdown(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if !self.core.shutdown.begin_shutdown() {
+            self.core
+                .debug_logs
+                .info("runtime.exit", "服务退出流程已在执行，忽略重复退出请求");
+            return;
+        }
+
+        self.listeners_ready.store(false, Ordering::Release);
+
+        self.core.debug_logs.info("runtime.exit", &reason);
+        let _ = self
+            .runtime_events
+            .send(RuntimeEvent::RuntimeExiting(RuntimeExitingPayload {
+                reason,
+                timestamp: current_timestamp_ms(),
+            }));
+    }
+
+    pub(crate) fn try_start_file_cleanup_worker(&self) -> bool {
+        self.file_cleanup_worker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn finish_file_cleanup_worker(&self) {
+        self.file_cleanup_worker_running
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn notify_file_cleanup_worker(&self) {
+        self.file_cleanup_worker_notify.notify_one();
+    }
+
+    pub(crate) async fn wait_for_file_cleanup_worker_notification(&self) {
+        self.file_cleanup_worker_notify.notified().await;
+    }
+}
+
+pub async fn bootstrap_http_app_state(
+    runtime: &ServerRuntimeConfig,
+) -> Result<Arc<HttpAppState>, String> {
+    match refresh_accessible_paths_from_fnos(
+        &FnosApiClient::default(),
+        &runtime.accessible_paths_path,
+    )
+    .await
+    {
+        Ok(result) => tracing::info!(
+            target: "storage.accessible-paths",
+            path_count = result.paths.len(),
+            http_status = result.http_status,
+            business_code = result.business_code,
+            "已在启动阶段刷新 fnOS 共享授权目录"
+        ),
+        Err(error) => tracing::warn!(
+            target: "storage.accessible-paths",
+            error = %error,
+            "启动阶段无法刷新 fnOS 共享授权目录，继续使用旧快照"
+        ),
+    }
+    let generation = match crate::runtime::resolve_aria2_binary(runtime, &Aria2Config::from_env()) {
+        Ok(binary) => crate::runtime::aria2_process::inspect_engine_generation(&binary.path)
+            .await
+            .unwrap_or(crate::config::aria2::EngineGeneration::Unknown),
+        Err(_) => crate::config::aria2::EngineGeneration::Unknown,
+    };
+    let mut compatibility = compatibility::AppCompatibility::for_engine(generation);
+    let database = if compatibility.mode == "restricted" && runtime.database_path.exists() {
+        crate::database::open_existing_database(runtime.database_path.clone()).await?
+    } else {
+        connect_database(runtime.database_path.clone()).await?
+    };
+    let restored_tasks = if compatibility.mode == "restricted" {
+        Vec::new()
+    } else {
+        match list_download_tasks_for_engine(&database.pool, generation).await {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                compatibility =
+                    compatibility::AppCompatibility::restricted(generation, "legacy_state_invalid");
+                tracing::warn!("任务快照不可读取，进入受限管理：{error}");
+                Vec::new()
+            }
+        }
+    };
+    let accessible_paths = load_accessible_paths(&runtime.accessible_paths_path)?;
+    let fallback_download_dir = default_download_dir(&accessible_paths, &runtime.app_data_dir)
+        .display()
+        .to_string();
+    let app_config = load_app_config_from_pool(&database.pool, &fallback_download_dir).await?;
+    let json_rpc_token = load_json_rpc_token(&database.pool).await?;
+    let lan_json_rpc_config = load_lan_json_rpc_config(&database.pool).await?;
+    let next_task_id = max_download_task_id(&database.pool)
+        .await?
+        .saturating_add(1);
+    let state = ServerState::new(database, restored_tasks, next_task_id);
+    let state = Arc::new(HttpAppState::new(state, runtime.clone()));
+    *state
+        .compatibility
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = compatibility;
+    state.set_app_config(app_config.clone()).await;
+    state
+        .refresh_json_rpc_default_download_dir(&app_config.default_download_dir, &accessible_paths);
+    state.remember_json_rpc_token(&json_rpc_token);
+    *state.lan_json_rpc_config.write().await = lan_json_rpc_config;
+    // cmd/start 已完成孤儿进程对账；必须在未完成操作可能唤醒 Aria2 前收敛旧日志。
+    crate::runtime::maintain_startup_aria2_logs(&state).await;
+    if state.ensure_download_available().is_ok() {
+        crate::runtime::reconcile_unfinished_task_operations(&state).await?;
+        crate::runtime::spawn_file_cleanup_worker(Arc::clone(&state)).await;
+    }
+
+    Ok(state)
+}
+
+pub async fn run_server() -> Result<(), String> {
+    let runtime = ServerRuntimeConfig::from_env()?;
+    let _process_lock = ServerProcessLock::acquire(&runtime.app_data_dir)?;
+    let state = bootstrap_http_app_state(&runtime).await?;
+    let listeners = bind_http_listeners(&runtime).await?;
+    state
+        .lan_jsonrpc_port_in_use
+        .store(listeners.lan_jsonrpc.is_none(), Ordering::Relaxed);
+    state.mark_listeners_ready();
+    crate::runtime::spawn_task_monitor(state.clone());
+
+    state.core.debug_logs.info(
+        "app",
+        format!(
+            "管理服务入口已初始化，监听地址 {}{}，数据目录 {}",
+            state.runtime.http_addr,
+            management_ipv6_port(state.runtime.http_addr)
+                .map(|port| format!(" 和 [::]:{}", port))
+                .unwrap_or_default(),
+            state.runtime.app_data_dir.display()
+        ),
+    );
+    state.core.debug_logs.info(
+        "app",
+        format!(
+            "JSON-RPC 专用入口已初始化，监听地址 {}",
+            state.runtime.jsonrpc_addr
+        ),
+    );
+
+    serve_http_listeners(state, listeners, wait_for_shutdown_signal()).await
+}
+
+pub async fn run_cli(args: &[String]) -> Result<(), String> {
+    match args {
+        [] => run_server().await,
+        [command] if command == "initialize-web-auth" => initialize_web_auth().await,
+        [command] if command == "reset-web-auth" => reset_web_auth().await,
+        [command] if command == "database-check" => database_check().await,
+        [command, output] if command == "database-backup" => database_backup(output).await,
+        [command, before] if command == "database-cleanup-history" => {
+            database_cleanup_history(before, false).await
+        }
+        [command, before, flag]
+            if command == "database-cleanup-history" && flag == "--apply" =>
+        {
+            database_cleanup_history(before, true).await
+        }
+        _ => Err(
+            "用法：motrix-fnos-server [initialize-web-auth|reset-web-auth|database-check|database-backup <output>|database-cleanup-history <before_timestamp_ms> [--apply]]".to_string(),
+        ),
+    }
+}
+
+async fn database_check() -> Result<(), String> {
+    let runtime = ServerRuntimeConfig::from_env()?;
+    let _process_lock = ServerProcessLock::acquire(&runtime.app_data_dir)?;
+    check_integrity(runtime.database_path.clone()).await?;
+    println!("数据库完整性检查通过：{}", runtime.database_path.display());
+    Ok(())
+}
+
+async fn database_backup(output: &str) -> Result<(), String> {
+    let runtime = ServerRuntimeConfig::from_env()?;
+    let _process_lock = ServerProcessLock::acquire(&runtime.app_data_dir)?;
+    let output = PathBuf::from(output);
+    backup_database(runtime.database_path, output.clone()).await?;
+    println!("数据库备份已生成：{}", output.display());
+    Ok(())
+}
+
+async fn database_cleanup_history(before: &str, apply: bool) -> Result<(), String> {
+    let before = before
+        .parse::<i64>()
+        .map_err(|error| format!("清理时间必须是毫秒时间戳：{}", error))?;
+    let runtime = ServerRuntimeConfig::from_env()?;
+    let _process_lock = ServerProcessLock::acquire(&runtime.app_data_dir)?;
+    let database = connect_database(runtime.database_path).await?;
+    let report = cleanup_history(&database.pool, before, apply).await;
+    database.pool.close().await;
+    let report = report?;
+    if report.applied {
+        println!(
+            "历史记录清理完成：删除历史 {} 条，删除错误 {} 条",
+            report.history_count, report.error_count
+        );
+    } else {
+        println!(
+            "历史记录清理预览：可删除历史 {} 条，错误 {} 条；追加 --apply 才会删除",
+            report.history_count, report.error_count
+        );
+    }
+    Ok(())
+}
+
+fn cli_message(chinese: &'static str, english: &'static str) -> &'static str {
+    match env::var("TRIM_SYS_LANGUAGE") {
+        Ok(language) if !language.to_ascii_lowercase().starts_with("zh") => english,
+        _ => chinese,
+    }
+}
+
+async fn reset_web_auth() -> Result<(), String> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(cli_message("请在 NAS 本机交互终端执行 cmd/reset-web-auth，不支持管道或重定向", "Run cmd/reset-web-auth in a local interactive terminal on the NAS; pipes and redirection are not supported").to_string());
+    }
+    // 隐藏输入与信号后的终端恢复由 FPK 包装命令负责。
+    let status = std::process::Command::new("stty")
+        .arg("-a")
+        .stdin(std::process::Stdio::inherit())
+        .output()
+        .map_err(|_| {
+            cli_message(
+                "无法检查终端，请使用 cmd/reset-web-auth",
+                "Could not inspect the terminal; use cmd/reset-web-auth",
+            )
+            .to_string()
+        })?;
+    let settings = String::from_utf8_lossy(&status.stdout);
+    if !status.status.success()
+        || !settings
+            .split_whitespace()
+            .any(|value| value.trim_end_matches(';') == "-echo")
+    {
+        return Err(cli_message("请使用 cmd/reset-web-auth 进行隐藏输入，勿直接执行 server 命令", "Use cmd/reset-web-auth for hidden input instead of invoking the server command directly").to_string());
+    }
+    let runtime = ServerRuntimeConfig::from_env()?;
+    reset_web_auth_with_runtime(&runtime, || {
+        let password = read_terminal_password(cli_message(
+            "请输入新管理密码：",
+            "Enter the new management password: ",
+        ))?;
+        let confirmation = read_terminal_password(cli_message(
+            "请再次输入新管理密码：",
+            "Enter the new management password again: ",
+        ))?;
+        if password != confirmation {
+            return Err(cli_message(
+                "两次输入的管理密码不一致，未修改密码",
+                "The management passwords do not match; the password was not changed",
+            )
+            .to_string());
+        }
+        Ok(password)
+    })
+    .await?;
+    println!(
+        "{}",
+        cli_message(
+            "管理密码已重置，旧登录凭据已失效",
+            "The management password was reset; previous access tokens are now invalid"
+        )
+    );
+    Ok(())
+}
+
+fn read_terminal_password(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    std::io::stdout().flush().map_err(|_| {
+        cli_message("无法显示密码提示", "Could not display the password prompt").to_string()
+    })?;
+    let mut bytes = Vec::new();
+    let count = std::io::stdin()
+        .lock()
+        .take(514)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|_| {
+            cli_message(
+                "读取密码失败，未修改密码",
+                "Could not read the password; the password was not changed",
+            )
+            .to_string()
+        })?;
+    println!();
+    if count == 0 || bytes.last() != Some(&b'\n') {
+        return Err(cli_message("密码输入已取消或超过长度限制，未修改密码", "Password input was cancelled or exceeded the length limit; the password was not changed").to_string());
+    }
+    bytes.pop();
+    String::from_utf8(bytes).map_err(|_| {
+        cli_message(
+            "密码必须是有效 UTF-8 文本",
+            "The password must be valid UTF-8 text",
+        )
+        .to_string()
+    })
+}
+
+async fn reset_web_auth_with_runtime(
+    runtime: &ServerRuntimeConfig,
+    read_password: impl FnOnce() -> Result<String, String>,
+) -> Result<(), String> {
+    let _process_lock = ServerProcessLock::acquire(&runtime.app_data_dir)?;
+    let password = read_password()?;
+    let database = connect_database(runtime.database_path.clone()).await?;
+    let result = AuthService::new(database.pool.clone())
+        .reset(&password)
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            crate::auth::AuthError::InvalidPassword(_) => cli_message(
+                "密码必须为 8–128 个字符，且不能超过 512 字节；未修改密码",
+                "The password must contain 8–128 characters and use no more than 512 bytes; the password was not changed",
+            ).to_string(),
+            error => format!("{}: {error:?}", cli_message("重置 Web 鉴权失败", "Failed to reset web authentication")),
+        });
+    database.pool.close().await;
+    result
+}
+
+async fn initialize_web_auth() -> Result<(), String> {
+    let password = env::var("wizard_management_password").ok();
+    let confirmation = env::var("wizard_management_password_confirm").ok();
+    env::remove_var("wizard_management_password");
+    env::remove_var("wizard_management_password_confirm");
+    let runtime = ServerRuntimeConfig::from_env()?;
+    initialize_web_auth_with_runtime(&runtime, password.as_deref(), confirmation.as_deref()).await
+}
+
+async fn initialize_web_auth_with_runtime(
+    runtime: &ServerRuntimeConfig,
+    password: Option<&str>,
+    confirmation: Option<&str>,
+) -> Result<(), String> {
+    let _process_lock = ServerProcessLock::acquire(&runtime.app_data_dir)?;
+    let database = connect_database(runtime.database_path.clone()).await?;
+    let service = AuthService::new(database.pool.clone());
+    let result = async {
+        let state = service
+            .state()
+            .await
+            .map_err(|error| format!("读取管理密码状态失败：{error:?}"))?;
+        if !state.setup_required {
+            println!("已保留原管理密码");
+            return Ok(());
+        }
+        let password = password.ok_or_else(|| "安装向导未提供管理密码".to_string())?;
+        if Some(password) != confirmation {
+            return Err("两次输入的管理密码不一致，请重新安装并确认密码".to_string());
+        }
+        service
+            .initialize_password(password)
+            .await
+            .map_err(|error| format!("初始化管理密码失败：{error:?}"))?;
+        println!("管理密码初始化完成");
+        Ok(())
+    }
+    .await;
+    database.pool.close().await;
+    result
+}
+
+#[derive(Debug)]
+struct HttpListeners {
+    management: TcpListener,
+    management_ipv6: Option<TcpListener>,
+    jsonrpc: TcpListener,
+    lan_jsonrpc: Option<TcpListener>,
+}
+
+async fn bind_http_listeners(runtime: &ServerRuntimeConfig) -> Result<HttpListeners, String> {
+    let management = TcpListener::bind(runtime.http_addr)
+        .await
+        .map_err(|error| format!("绑定管理监听地址失败：{}（{}）", runtime.http_addr, error))?;
+    let management_ipv6 = management_ipv6_port(runtime.http_addr)
+        .map(|_| {
+            management
+                .local_addr()
+                .map_err(|error| {
+                    format!("读取管理监听端口失败：{}（{}）", runtime.http_addr, error)
+                })
+                .and_then(|addr| bind_ipv6_management_listener(addr.port()))
+        })
+        .transpose()?;
+    let jsonrpc = TcpListener::bind(runtime.jsonrpc_addr)
+        .await
+        .map_err(|error| {
+            format!(
+                "绑定 JSON-RPC 监听地址失败：{}（{}）",
+                runtime.jsonrpc_addr, error
+            )
+        })?;
+    let lan_jsonrpc = match TcpListener::bind(runtime.lan_jsonrpc_addr).await {
+        Ok(listener) => Some(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(error) => {
+            return Err(format!(
+                "绑定局域网 JSON-RPC 监听地址失败：{}（{}）",
+                runtime.lan_jsonrpc_addr, error
+            ));
+        }
+    };
+
+    Ok(HttpListeners {
+        management,
+        management_ipv6,
+        jsonrpc,
+        lan_jsonrpc,
+    })
+}
+
+fn management_ipv6_port(addr: SocketAddr) -> Option<u16> {
+    match addr {
+        SocketAddr::V4(addr) if addr.ip().is_unspecified() => Some(addr.port()),
+        _ => None,
+    }
+}
+
+fn bind_ipv6_management_listener(port: u16) -> Result<TcpListener, String> {
+    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|error| format!("创建 IPv6 管理监听地址失败：{}（{}）", addr, error))?;
+    // 允许停用后立即重新监听，避免旧连接的 TIME_WAIT 阻止再次启用。
+    socket
+        .set_reuse_address(true)
+        .map_err(|error| format!("设置 IPv6 管理监听地址复用失败：{}（{}）", addr, error))?;
+    socket
+        .set_only_v6(true)
+        .map_err(|error| format!("设置 IPv6 管理监听地址失败：{}（{}）", addr, error))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| format!("设置 IPv6 管理监听非阻塞失败：{}（{}）", addr, error))?;
+    socket
+        .bind(&addr.into())
+        .map_err(|error| format!("绑定 IPv6 管理监听地址失败：{}（{}）", addr, error))?;
+    socket
+        .listen(1024)
+        .map_err(|error| format!("监听 IPv6 管理地址失败：{}（{}）", addr, error))?;
+    let listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(listener)
+        .map_err(|error| format!("接管 IPv6 管理监听地址失败：{}（{}）", addr, error))
+}
+
+enum HttpStopTrigger {
+    Signal(Result<String, String>),
+    Management(std::io::Result<()>),
+    ManagementIpv6(std::io::Result<()>),
+    JsonRpc(std::io::Result<()>),
+    LanJsonRpc(std::io::Result<()>),
+}
+
+async fn serve_http_listeners<F>(
+    state: Arc<HttpAppState>,
+    listeners: HttpListeners,
+    shutdown_signal: F,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<String, String>>,
+{
+    serve_http_listeners_with_shutdown_timeout(
+        state,
+        listeners,
+        shutdown_signal,
+        crate::runtime::SHUTDOWN_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
+async fn serve_http_listeners_with_shutdown_timeout<F>(
+    state: Arc<HttpAppState>,
+    listeners: HttpListeners,
+    shutdown_signal: F,
+    shutdown_timeout: Duration,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<String, String>>,
+{
+    let HttpListeners {
+        management,
+        management_ipv6,
+        jsonrpc,
+        lan_jsonrpc,
+    } = listeners;
+    state
+        .lan_jsonrpc_port_in_use
+        .store(lan_jsonrpc.is_none(), Ordering::Relaxed);
+    if lan_jsonrpc.is_none() {
+        state.core.debug_logs.warn(
+            "app",
+            format!(
+                "局域网 JSON-RPC 不可用：端口被占用（{}）；管理和回环 RPC 服务继续运行，释放端口后请重启应用",
+                state.runtime.lan_jsonrpc_addr
+            ),
+        );
+    } else {
+        state.core.debug_logs.info(
+            "app",
+            format!(
+                "局域网 JSON-RPC 入口已初始化，监听地址 {}",
+                state.runtime.lan_jsonrpc_addr
+            ),
+        );
+    }
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let management_shutdown = shutdown_receiver.clone();
+    let management_ipv6_shutdown = shutdown_receiver.clone();
+    let jsonrpc_shutdown = shutdown_receiver.clone();
+    let lan_jsonrpc_shutdown = shutdown_receiver.clone();
+    let management_server = axum::serve(
+        management,
+        crate::api::management_router(state.clone())
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_http_shutdown(management_shutdown))
+    .into_future();
+    let management_ipv6_state = state.clone();
+    let management_ipv6_server = async move {
+        match management_ipv6 {
+            Some(listener) => {
+                axum::serve(
+                    listener,
+                    crate::api::management_router(management_ipv6_state)
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(wait_for_http_shutdown(management_ipv6_shutdown))
+                .await
+            }
+            None => {
+                wait_for_http_shutdown(management_ipv6_shutdown).await;
+                Ok(())
+            }
+        }
+    };
+    let jsonrpc_server = axum::serve(jsonrpc, crate::api::jsonrpc_router(state.clone()))
+        .with_graceful_shutdown(wait_for_http_shutdown(jsonrpc_shutdown))
+        .into_future();
+    let lan_jsonrpc_state = state.clone();
+    let lan_jsonrpc_server = async move {
+        match lan_jsonrpc {
+            Some(listener) => {
+                axum::serve(
+                    listener,
+                    crate::api::lan_jsonrpc_router(lan_jsonrpc_state)
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(wait_for_http_shutdown(lan_jsonrpc_shutdown))
+                .await
+            }
+            None => {
+                wait_for_http_shutdown(lan_jsonrpc_shutdown).await;
+                Ok(())
+            }
+        }
+    };
+
+    tokio::pin!(management_server);
+    tokio::pin!(management_ipv6_server);
+    tokio::pin!(jsonrpc_server);
+    tokio::pin!(lan_jsonrpc_server);
+    tokio::pin!(shutdown_signal);
+
+    let trigger = tokio::select! {
+        signal = &mut shutdown_signal => HttpStopTrigger::Signal(signal),
+        result = &mut management_server => HttpStopTrigger::Management(result),
+        result = &mut management_ipv6_server => HttpStopTrigger::ManagementIpv6(result),
+        result = &mut jsonrpc_server => HttpStopTrigger::JsonRpc(result),
+        result = &mut lan_jsonrpc_server => HttpStopTrigger::LanJsonRpc(result),
+    };
+
+    let (reason, primary_error) = match &trigger {
+        HttpStopTrigger::Signal(Ok(reason)) => (reason.clone(), None),
+        HttpStopTrigger::Signal(Err(error)) => (
+            "等待停止信号失败，准备关闭服务".to_string(),
+            Some(error.clone()),
+        ),
+        HttpStopTrigger::Management(Ok(())) => (
+            "管理 HTTP 服务意外停止".to_string(),
+            Some("管理 HTTP 服务意外停止".to_string()),
+        ),
+        HttpStopTrigger::Management(Err(error)) => (
+            "管理 HTTP 服务运行失败，准备关闭 JSON-RPC 服务".to_string(),
+            Some(format!("管理 HTTP 服务运行失败：{}", error)),
+        ),
+        HttpStopTrigger::ManagementIpv6(Ok(())) => (
+            "IPv6 管理 HTTP 服务意外停止".to_string(),
+            Some("IPv6 管理 HTTP 服务意外停止".to_string()),
+        ),
+        HttpStopTrigger::ManagementIpv6(Err(error)) => (
+            "IPv6 管理 HTTP 服务运行失败，准备关闭其他服务".to_string(),
+            Some(format!("IPv6 管理 HTTP 服务运行失败：{}", error)),
+        ),
+        HttpStopTrigger::JsonRpc(Ok(())) => (
+            "JSON-RPC HTTP 服务意外停止".to_string(),
+            Some("JSON-RPC HTTP 服务意外停止".to_string()),
+        ),
+        HttpStopTrigger::JsonRpc(Err(error)) => (
+            "JSON-RPC HTTP 服务运行失败，准备关闭管理服务".to_string(),
+            Some(format!("JSON-RPC HTTP 服务运行失败：{}", error)),
+        ),
+        HttpStopTrigger::LanJsonRpc(Ok(())) => (
+            "局域网 JSON-RPC HTTP 服务意外停止".to_string(),
+            Some("局域网 JSON-RPC HTTP 服务意外停止".to_string()),
+        ),
+        HttpStopTrigger::LanJsonRpc(Err(error)) => (
+            "局域网 JSON-RPC HTTP 服务运行失败，准备关闭其他服务".to_string(),
+            Some(format!("局域网 JSON-RPC HTTP 服务运行失败：{}", error)),
+        ),
+    };
+
+    let shutdown_deadline = Instant::now() + shutdown_timeout;
+    state.request_shutdown(reason);
+    let _ = shutdown_sender.send(true);
+    let _ = crate::runtime::run_shutdown_cleanup_until(&state, shutdown_deadline).await;
+
+    let remaining_error = match timeout_at(shutdown_deadline, async {
+        match trigger {
+            HttpStopTrigger::Signal(_) => {
+                let (management_result, management_ipv6_result, jsonrpc_result, lan_jsonrpc_result) = tokio::join!(
+                    &mut management_server,
+                    &mut management_ipv6_server,
+                    &mut jsonrpc_server,
+                    &mut lan_jsonrpc_server
+                );
+                combine_server_errors([
+                    ("管理 HTTP 服务", management_result),
+                    ("IPv6 管理 HTTP 服务", management_ipv6_result),
+                    ("JSON-RPC HTTP 服务", jsonrpc_result),
+                    ("局域网 JSON-RPC HTTP 服务", lan_jsonrpc_result),
+                ])
+            }
+            HttpStopTrigger::Management(_) => {
+                let (management_ipv6_result, jsonrpc_result, lan_jsonrpc_result) = tokio::join!(
+                    &mut management_ipv6_server,
+                    &mut jsonrpc_server,
+                    &mut lan_jsonrpc_server
+                );
+                combine_server_errors([
+                    ("IPv6 管理 HTTP 服务", management_ipv6_result),
+                    ("JSON-RPC HTTP 服务", jsonrpc_result),
+                    ("局域网 JSON-RPC HTTP 服务", lan_jsonrpc_result),
+                ])
+            }
+            HttpStopTrigger::ManagementIpv6(_) => {
+                let (management_result, jsonrpc_result, lan_jsonrpc_result) = tokio::join!(
+                    &mut management_server,
+                    &mut jsonrpc_server,
+                    &mut lan_jsonrpc_server
+                );
+                combine_server_errors([
+                    ("管理 HTTP 服务", management_result),
+                    ("JSON-RPC HTTP 服务", jsonrpc_result),
+                    ("局域网 JSON-RPC HTTP 服务", lan_jsonrpc_result),
+                ])
+            }
+            HttpStopTrigger::JsonRpc(_) => {
+                let (management_result, management_ipv6_result, lan_jsonrpc_result) = tokio::join!(
+                    &mut management_server,
+                    &mut management_ipv6_server,
+                    &mut lan_jsonrpc_server
+                );
+                combine_server_errors([
+                    ("管理 HTTP 服务", management_result),
+                    ("IPv6 管理 HTTP 服务", management_ipv6_result),
+                    ("局域网 JSON-RPC HTTP 服务", lan_jsonrpc_result),
+                ])
+            }
+            HttpStopTrigger::LanJsonRpc(_) => {
+                let (management_result, management_ipv6_result, jsonrpc_result) = tokio::join!(
+                    &mut management_server,
+                    &mut management_ipv6_server,
+                    &mut jsonrpc_server
+                );
+                combine_server_errors([
+                    ("管理 HTTP 服务", management_result),
+                    ("IPv6 管理 HTTP 服务", management_ipv6_result),
+                    ("JSON-RPC HTTP 服务", jsonrpc_result),
+                ])
+            }
+        }
+    })
+    .await
+    {
+        Ok(error) => error,
+        Err(_) => {
+            state.core.debug_logs.warn(
+                "runtime.exit",
+                "HTTP 服务排空超过退出总时限，强制结束 server 进程",
+            );
+            Some("HTTP 服务排空超过退出总时限".to_string())
+        }
+    };
+
+    match (primary_error, remaining_error) {
+        (Some(primary), Some(remaining)) => Err(format!("{}；{}", primary, remaining)),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
+    }
+}
+
+fn combine_server_errors<const N: usize>(
+    results: [(&str, std::io::Result<()>); N],
+) -> Option<String> {
+    let errors = results
+        .into_iter()
+        .filter_map(|(name, result)| {
+            result
+                .err()
+                .map(|error| format!("{}停止失败：{}", name, error))
+        })
+        .collect::<Vec<_>>();
+    (!errors.is_empty()).then(|| errors.join("；"))
+}
+
+async fn wait_for_http_shutdown(mut receiver: watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<String, String> {
+    tokio::signal::ctrl_c()
+        .await
+        .map(|()| "收到停止信号".to_string())
+        .map_err(|error| format!("等待停止信号失败：{}", error))
+}
+
+fn parse_trusted_proxy_ips() -> Result<Vec<IpAddr>, String> {
+    let value = env::var(TRUSTED_PROXY_IPS_ENV).unwrap_or_default();
+    let mut addresses = Vec::new();
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let address = item
+            .parse::<IpAddr>()
+            .map_err(|error| format!("解析可信代理地址失败：{}（{}）", item, error))?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
+}
+
+fn default_local_app_data_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return home_dir_fallback()
+            .join("Library")
+            .join("Application Support")
+            .join("motrix-fnos");
+    }
+
+    if let Some(path) = env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return path.join("motrix-fnos");
+    }
+
+    home_dir_fallback()
+        .join(".local")
+        .join("share")
+        .join("motrix-fnos")
+}
+
+fn home_dir_fallback() -> PathBuf {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

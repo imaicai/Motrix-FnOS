@@ -1,0 +1,676 @@
+import { describe, expect, it, vi } from "vitest";
+vi.mock("naive-ui", async () => {
+  const { defineComponent, h } = await import("vue");
+  const slotStub = (name: string) =>
+    defineComponent({
+      name,
+      setup(_, { slots }) {
+        return () => h("div", { "data-test": name }, slots.default?.());
+      },
+    });
+
+  return {
+    useMessage: () => ({ success: vi.fn(), warning: vi.fn(), error: vi.fn() }),
+    NButton: defineComponent({
+      name: "NButtonStub",
+      props: {
+        disabled: {
+          type: Boolean,
+          default: false,
+        },
+      },
+      emits: ["click"],
+      setup(props, { emit, slots, attrs }) {
+        return () =>
+          h(
+            "button",
+            {
+              ...attrs,
+              disabled: props.disabled,
+              onClick: (event: MouseEvent) => {
+                if (!props.disabled) {
+                  emit("click", event);
+                }
+              },
+            },
+            slots.default?.(),
+        );
+      },
+    }),
+    NCard: defineComponent({
+      name: "NCardStub",
+      setup(_, { slots }) {
+        return () =>
+          h("div", { "data-test": "n-card" }, [
+            ...(slots.default?.() ?? []),
+            ...(slots.footer?.() ?? []),
+          ]);
+      },
+    }),
+    NDescriptions: slotStub("n-descriptions"),
+    NDescriptionsItem: defineComponent({
+      name: "NDescriptionsItemStub",
+      props: {
+        label: {
+          type: String,
+          required: true,
+        },
+      },
+      setup(props, { slots }) {
+        return () => h("div", { "data-test": "n-descriptions-item" }, [props.label, slots.default?.()]);
+      },
+    }),
+    NModal: defineComponent({
+      name: "NModalStub",
+      props: {
+        show: {
+          type: Boolean,
+          default: false,
+        },
+      },
+      setup(props, { slots }) {
+        return () => (props.show ? h("div", { "data-test": "n-modal" }, slots.default?.()) : null);
+      },
+    }),
+    NSpace: slotStub("n-space"),
+    NCheckbox: defineComponent({
+      name: "NCheckboxStub",
+      props: {
+        checked: {
+          type: Boolean,
+          default: false,
+        },
+      },
+      emits: ["update:checked"],
+      setup(props, { emit, slots }) {
+        return () =>
+          h("label", { "data-test": "n-checkbox" }, [
+            h("input", {
+              type: "checkbox",
+              checked: props.checked,
+              onChange: (event: Event) => {
+                const target = event.target as HTMLInputElement;
+                emit("update:checked", target.checked);
+              },
+            }),
+            slots.default?.(),
+          ]);
+      },
+    }),
+    NSwitch: defineComponent({
+      name: "NSwitchStub",
+      inheritAttrs: false,
+      props: {
+        value: { type: Boolean, default: false },
+        disabled: { type: Boolean, default: false },
+        loading: { type: Boolean, default: false },
+      },
+      emits: ["update:value"],
+      setup(props, { emit, attrs }) {
+        return () =>
+          h("button", {
+            ...attrs,
+            type: "button",
+            role: "switch",
+            disabled: props.disabled,
+            "aria-checked": String(props.value),
+            "data-loading": String(props.loading),
+            onClick: () => {
+              if (!props.disabled) emit("update:value", !props.value);
+            },
+          });
+      },
+    }),
+  };
+});
+
+import TaskActions from "./TaskActions.vue";
+import { flushPromises, mountWithPinia } from "../../../test/mount";
+import type {
+  TaskActionConfirmTexts,
+  TaskActionDetails,
+  TaskActionLabels,
+  TaskActionPermissions,
+  TaskActionState,
+} from "./taskActionViewModel";
+import type { DownloadTask } from "../../../types/tasks";
+
+describe("TaskActions", () => {
+  it("waits for a fresh file check before opening redownload and makes cancellation read only", async () => {
+    let resolveCheck!: (allowed: boolean) => void;
+    const prepareRedownload = vi.fn(() => new Promise<boolean>((resolve) => { resolveCheck = resolve; }));
+    const { wrapper } = mountTaskActions({
+      task: { status: "complete" }, permissions: { canRedownload: true }, prepareRedownload,
+    });
+    await clickButton(wrapper, "重新下载");
+    expect(wrapper.findComponent({ name: "TaskDownloadConfirmDialog" }).props("show")).toBe(false);
+    resolveCheck(false);
+    await flushPromises();
+    expect(wrapper.findComponent({ name: "TaskDownloadConfirmDialog" }).props("show")).toBe(false);
+    await clickButton(wrapper, "重新下载");
+    resolveCheck(true);
+    await flushPromises();
+    expect(wrapper.findComponent({ name: "TaskDownloadConfirmDialog" }).props("show")).toBe(true);
+    await clickButton(wrapper, "取消");
+    expect(wrapper.emitted("confirmRedownload")).toBeUndefined();
+  });
+  it("shows buttons for active, paused, complete and removed states", async () => {
+    const { wrapper: activeWrapper } = mountTaskActions({
+      permissions: { canPause: true },
+    });
+    expect(activeWrapper.text()).toContain("暂停");
+    expect(activeWrapper.text()).not.toContain("继续");
+
+    const { wrapper: pausedWrapper } = mountTaskActions({
+      permissions: { canResume: true },
+    });
+    expect(pausedWrapper.text()).toContain("继续");
+    expect(pausedWrapper.text()).not.toContain("暂停");
+
+    const { wrapper: confirmWrapper } = mountTaskActions({
+      permissions: {
+        canConfirmFiles: true,
+        canResume: false,
+      },
+    });
+    expect(confirmWrapper.text()).toContain("确认文件");
+    expect(confirmWrapper.text()).not.toContain("继续");
+
+    const { wrapper: completeWrapper } = mountTaskActions({
+      permissions: { canRedownload: true },
+    });
+    expect(completeWrapper.text()).toContain("重新下载");
+
+    const { wrapper: removedWrapper } = mountTaskActions({
+      permissions: {
+        canRestore: true,
+        canPermanentDelete: true,
+        canDelete: false,
+      },
+    });
+    expect(removedWrapper.text()).toContain("恢复");
+    expect(removedWrapper.text()).toContain("永久删除");
+  });
+
+  it("emits pause, resume, confirmFiles and confirmed restore on desktop and mobile", async () => {
+    const { wrapper } = mountTaskActions({
+      mode: "desktop",
+      permissions: {
+        canPause: true,
+        canResume: true,
+        canConfirmFiles: true,
+        canRestore: true,
+      },
+    });
+
+    await clickButton(wrapper, "暂停");
+    await clickButton(wrapper, "继续");
+    await clickButton(wrapper, "确认文件");
+    await clickButton(wrapper, "恢复");
+    await clickButton(wrapper, "恢复", -1);
+
+    expect(wrapper.emitted("pause")).toHaveLength(1);
+    expect(wrapper.emitted("resume")).toHaveLength(1);
+    expect(wrapper.emitted("confirmFiles")).toHaveLength(1);
+    expect(wrapper.emitted("restore")).toHaveLength(1);
+
+    const { wrapper: compactWrapper } = mountTaskActions({
+      mode: "mobile",
+      permissions: {
+        canPause: true,
+        canResume: true,
+        canConfirmFiles: true,
+        canRestore: true,
+      },
+    });
+
+    await clickButton(compactWrapper, "暂停");
+    await clickButton(compactWrapper, "继续");
+    await clickButton(compactWrapper, "确认文件");
+    await clickButton(compactWrapper, "恢复");
+    await clickButton(compactWrapper, "恢复", -1);
+
+    expect(compactWrapper.emitted("pause")).toHaveLength(1);
+    expect(compactWrapper.emitted("resume")).toHaveLength(1);
+    expect(compactWrapper.emitted("confirmFiles")).toHaveLength(1);
+    expect(compactWrapper.emitted("restore")).toHaveLength(1);
+  });
+
+  it("applies the shared action class in every layout", () => {
+    const permissions = {
+      canPause: true,
+      canResume: true,
+      canConfirmFiles: true,
+      canRedownload: true,
+      canDelete: true,
+      canPermanentDelete: true,
+    };
+    const variants = [
+      mountTaskActions({ mode: "mobile", permissions }),
+      mountTaskActions({ mode: "desktop", permissions }),
+    ];
+
+    for (const { wrapper } of variants) {
+      const buttons = wrapper.findAll("button");
+      expect(buttons).toHaveLength(7);
+      expect(buttons.every((button) => button.classes("task-action-button"))).toBe(true);
+    }
+  });
+
+  it("confirms moving to Trash without a file deletion option", async () => {
+    const { wrapper } = mountTaskActions({ permissions: { canDelete: true } });
+    await clickButton(wrapper, "删除");
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
+    await clickButton(wrapper, "删除", -1);
+    expect(wrapper.emitted("confirmDelete")).toEqual([[]]);
+  });
+
+  it("forwards the file deletion choice from permanent deletion", async () => {
+    const { wrapper } = mountTaskActions({ task: { status: "removed" }, permissions: { canPermanentDelete: true } });
+    await clickButton(wrapper, "永久删除");
+    await wrapper.get('input[type="checkbox"]').setValue(true);
+    await clickButton(wrapper, "永久删除", -1);
+    expect(wrapper.emitted("confirmPermanentDelete")).toEqual([[true]]);
+  });
+
+  it.each([false, true])("hides file deletion before magnet confirmation (awaiting=%s)", async (confirmationRequired) => {
+    const { wrapper } = mountTaskActions({
+      task: {
+        url: "magnet:?xt=urn:btih:test", sourceType: "magnet", status: "removed", filePath: null, completedLength: 0,
+        confirmationRequired,
+        files: confirmationRequired ? [{ index: 1, path: "/downloads/preview.bin", name: "preview.bin", length: 100, completedLength: 0, selected: true }] : [],
+      },
+      permissions: { canPermanentDelete: true },
+    });
+    await clickButton(wrapper, "永久删除");
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
+    await clickButton(wrapper, "永久删除", -1);
+    expect(wrapper.emitted("confirmPermanentDelete")).toEqual([[false]]);
+  });
+
+  it("offers file deletion for confirmed magnets even at zero progress", async () => {
+    const { wrapper } = mountTaskActions({
+      task: {
+        url: "magnet:?xt=urn:btih:test", sourceType: "magnet", status: "removed", ownedTaskDir: "/downloads/owned",
+        confirmationRequired: false, completedLength: 0,
+      },
+      permissions: { canPermanentDelete: true },
+    });
+    await clickButton(wrapper, "永久删除");
+    await wrapper.get('input[type="checkbox"]').setValue(true);
+    await clickButton(wrapper, "永久删除", -1);
+    expect(wrapper.emitted("confirmPermanentDelete")).toEqual([[true]]);
+  });
+
+  it("renders details from ordered detail items", async () => {
+    const { wrapper } = mountTaskActions({
+      details: {
+        items: [
+          { label: "任务名称", value: "file.iso" },
+          { label: "状态", value: "下载中" },
+        ],
+      },
+    });
+
+    await clickButton(wrapper, "详情");
+
+    const detailItems = wrapper.findAll('[data-test="detail-item"]');
+    expect(detailItems.map((item) => item.text())).toEqual(["任务名称file.iso", "状态下载中"]);
+  });
+
+  it("closes opened modals when runtime starts exiting", async () => {
+    const { wrapper, props } = mountTaskActions({
+      permissions: { canDelete: true },
+      state: { isRuntimeExiting: false },
+    });
+
+    await clickButton(wrapper, "删除");
+    expect(wrapper.findAll('[data-test="n-modal"]')).toHaveLength(1);
+
+    await wrapper.setProps({
+      state: {
+        ...props.state,
+        isRuntimeExiting: true,
+      },
+    });
+    await flushPromises();
+
+    expect(wrapper.findAll('[data-test="n-modal"]')).toHaveLength(0);
+  });
+
+  it("renders only permitted icon-pill actions with accessible labels and titles", () => {
+    const { wrapper } = mountTaskActions({
+      mode: "desktop",
+      permissions: {
+        canPause: true,
+        canResume: false,
+        canConfirmFiles: true,
+        canRedownload: false,
+        canDelete: false,
+        canPermanentDelete: false,
+        canRestore: true,
+      },
+    });
+
+    expect(findIconButton(wrapper, "详情").exists()).toBe(true);
+    expect(findIconButton(wrapper, "暂停").exists()).toBe(true);
+    expect(findIconButton(wrapper, "确认文件").exists()).toBe(true);
+    expect(findIconButton(wrapper, "继续").exists()).toBe(false);
+    expect(findIconButton(wrapper, "重新下载").exists()).toBe(false);
+    expect(findIconButton(wrapper, "删除").exists()).toBe(false);
+    expect(findIconButton(wrapper, "永久删除").exists()).toBe(false);
+    expect(findIconButton(wrapper, "恢复").exists()).toBe(true);
+
+    const expectedIcons = new Map([
+      ["详情", "info"],
+      ["暂停", "pause"],
+      ["确认文件", "confirm"],
+      ["恢复", "restore"],
+    ]);
+
+    for (const [label, iconName] of expectedIcons) {
+      const button = findIconButton(wrapper, label);
+      expect(button.attributes("aria-label")).toBe(label);
+      expect(button.attributes("title")).toBe(label);
+      expect(button.get("svg").attributes("data-icon-name")).toBe(iconName);
+    }
+  });
+
+  it("shows the file manager action only for completed tasks in a host", async () => {
+    const { wrapper } = mountTaskActions({
+      task: { status: "complete" },
+      permissions: { canDelete: false },
+      fileActions: { hostSupported: true, loading: false, context: null },
+    });
+
+    await clickButton(wrapper, "在文件管理器中打开");
+    expect(wrapper.emitted("openFileManager")).toHaveLength(1);
+
+    const { wrapper: standaloneWrapper } = mountTaskActions({
+      task: { status: "complete" },
+      permissions: { canDelete: false },
+      fileActions: { hostSupported: false, loading: false, context: null },
+    });
+    expect(standaloneWrapper.text()).not.toContain("在文件管理器中打开");
+  });
+
+  it("emits direct actions from icon-pill buttons", async () => {
+    const { wrapper } = mountTaskActions({
+      mode: "desktop",
+      permissions: {
+        canPause: true,
+        canResume: true,
+        canConfirmFiles: true,
+        canRestore: true,
+      },
+    });
+
+    await clickIconButton(wrapper, "暂停");
+    await clickIconButton(wrapper, "继续");
+    await clickIconButton(wrapper, "确认文件");
+    await clickIconButton(wrapper, "恢复");
+    await clickButton(wrapper, "恢复", -1);
+
+    expect(wrapper.emitted("pause")).toHaveLength(1);
+    expect(wrapper.emitted("resume")).toHaveLength(1);
+    expect(wrapper.emitted("confirmFiles")).toHaveLength(1);
+    expect(wrapper.emitted("restore")).toHaveLength(1);
+  });
+
+  it("keeps the icon action slot but hides pause and resume icons while operating", () => {
+    const { wrapper } = mountTaskActions({
+      mode: "desktop",
+      state: {
+        isOperating: true,
+        isActionDisabled: true,
+      },
+      permissions: {
+        canPause: true,
+        canResume: true,
+      },
+    });
+
+    const pauseButton = findIconButton(wrapper, "暂停");
+    const resumeButton = findIconButton(wrapper, "继续");
+    expect(pauseButton.exists()).toBe(true);
+    expect(resumeButton.exists()).toBe(true);
+    expect(pauseButton.attributes("aria-busy")).toBe("true");
+    expect(resumeButton.attributes("aria-busy")).toBe("true");
+    expect(pauseButton.find('svg[data-icon-name="pause"]').exists()).toBe(false);
+    expect(resumeButton.find('svg[data-icon-name="play"]').exists()).toBe(false);
+  });
+
+  it("opens existing confirmation modals from icon-pill buttons", async () => {
+    const { wrapper: redownloadWrapper } = mountTaskActions({
+      mode: "desktop",
+      permissions: { canRedownload: true, canDelete: false },
+    });
+    await clickIconButton(redownloadWrapper, "重新下载");
+    expect(redownloadWrapper.find('[data-test="n-modal"]').text()).toContain("确认重新下载");
+
+    const { wrapper: deleteWrapper } = mountTaskActions({
+      mode: "desktop",
+      permissions: { canDelete: true },
+    });
+    await clickIconButton(deleteWrapper, "删除");
+    expect(deleteWrapper.find('[data-test="n-modal"]').text()).toContain("确认删除");
+
+    const { wrapper: permanentDeleteWrapper } = mountTaskActions({
+      mode: "desktop",
+      permissions: { canDelete: false, canPermanentDelete: true },
+    });
+    await clickIconButton(permanentDeleteWrapper, "永久删除");
+    expect(permanentDeleteWrapper.find('[data-test="n-modal"]').text()).toContain("确认永久删除");
+
+    const { wrapper: restoreWrapper } = mountTaskActions({
+      mode: "desktop",
+      permissions: { canDelete: false, canRestore: true },
+    });
+    await clickIconButton(restoreWrapper, "恢复");
+    expect(restoreWrapper.find('[data-test="n-modal"]').text()).toContain("确认恢复");
+  });
+
+  it("keeps the detail proxy switch controlled and confirms changes for active tasks", async () => {
+    const { wrapper: pausedWrapper } = mountTaskActions({
+      task: { status: "paused", useProxy: false },
+    });
+    await clickButton(pausedWrapper, "详情");
+    const pausedSwitch = pausedWrapper.get('button[role="switch"]');
+    await pausedSwitch.trigger("click");
+    expect(pausedWrapper.emitted("updateProxy")).toEqual([[true]]);
+    expect(pausedSwitch.attributes("aria-checked")).toBe("false");
+
+    const { wrapper: activeWrapper } = mountTaskActions({
+      task: { status: "active", useProxy: false },
+    });
+    await clickButton(activeWrapper, "详情");
+    await activeWrapper.get('button[role="switch"]').trigger("click");
+    expect(activeWrapper.emitted("updateProxy")).toBeUndefined();
+    expect(activeWrapper.text()).toContain("切换运行中任务的代理可能导致连接短暂重连");
+
+    await clickButton(activeWrapper, "继续切换");
+    expect(activeWrapper.emitted("updateProxy")).toEqual([[true]]);
+  });
+
+  it("inherits and allows overriding proxy use for redownload and restore", async () => {
+    const { wrapper: redownloadWrapper } = mountTaskActions({
+      task: { status: "complete", useProxy: true },
+      permissions: { canRedownload: true, canDelete: false },
+    });
+    await clickButton(redownloadWrapper, "重新下载");
+    const redownloadSwitch = redownloadWrapper.get('button[role="switch"]');
+    expect(redownloadSwitch.attributes("aria-checked")).toBe("true");
+    await redownloadSwitch.trigger("click");
+    await clickButton(redownloadWrapper, "重新下载", -1);
+    expect(redownloadWrapper.emitted("confirmRedownload")).toEqual([[false]]);
+
+    const { wrapper: restoreWrapper } = mountTaskActions({
+      task: { status: "removed", useProxy: true },
+      permissions: { canRestore: true, canDelete: false },
+    });
+    await clickButton(restoreWrapper, "恢复");
+    const restoreSwitch = restoreWrapper.get('button[role="switch"]');
+    expect(restoreSwitch.attributes("aria-checked")).toBe("true");
+    await restoreSwitch.trigger("click");
+    await clickButton(restoreWrapper, "恢复", -1);
+    expect(restoreWrapper.emitted("restore")).toEqual([[false]]);
+  });
+
+  it("hides task proxy controls for BT tasks", async () => {
+    const { wrapper } = mountTaskActions({
+      task: createTask({ sourceType: "magnet", url: "magnet:?xt=urn:btih:test", status: "complete" }),
+      permissions: { canRedownload: true, canDelete: false },
+    });
+
+    await clickButton(wrapper, "详情");
+    expect(wrapper.find('[data-test="task-detail-settings-section"]').exists()).toBe(false);
+
+    await clickButton(wrapper, "重新下载");
+    expect(wrapper.find('[data-test="task-proxy-toggle"]').exists()).toBe(false);
+  });
+});
+
+interface MountTaskActionsOverrides {
+  prepareRedownload?: () => Promise<boolean>;
+  mode?: "desktop" | "mobile";
+  state?: Partial<TaskActionState>;
+  permissions?: Partial<TaskActionPermissions>;
+  labels?: Partial<TaskActionLabels>;
+  details?: Partial<TaskActionDetails>;
+  confirmTexts?: Partial<TaskActionConfirmTexts>;
+  fileActions?: {
+    hostSupported: boolean;
+    loading: boolean;
+    context: null;
+  };
+  task?: Partial<DownloadTask>;
+}
+
+function mountTaskActions(overrides: MountTaskActionsOverrides = {}) {
+  const props = {
+    prepareRedownload: overrides.prepareRedownload,
+    mode: overrides.mode ?? "mobile",
+    task: createTask(overrides.task),
+    state: {
+      isOperating: false,
+      isActionDisabled: false,
+      isRuntimeExiting: false,
+      ...overrides.state,
+    },
+    permissions: {
+      canPause: false,
+      canResume: false,
+      canConfirmFiles: false,
+      canRedownload: false,
+      canDelete: true,
+      canRestore: false,
+      canPermanentDelete: false,
+      ...overrides.permissions,
+    },
+    labels: {
+      details: "详情",
+      pause: "暂停",
+      resume: "继续",
+      confirmFiles: "确认文件",
+      redownload: "重新下载",
+      delete: "删除",
+      restore: "恢复",
+      permanentDelete: "永久删除",
+      cancel: "取消",
+      close: "关闭",
+      openFileManager: "在文件管理器中打开",
+      openFile: "打开文件",
+      fileDetails: "文件详情",
+      hostOnly: "文件操作仅支持 fnOS 宿主环境。",
+      technicalInfo: "技术信息",
+      copyPath: "复制",
+      copied: "已复制",
+      copyFailed: "复制失败",
+      ...overrides.labels,
+    },
+    details: {
+      title: "任务详情",
+      items: [
+        { label: "任务名称", value: "file.iso" },
+        { label: "状态", value: "下载中" },
+        { label: "进度", value: "20%" },
+        { label: "大小", value: "20 MB / 100 MB" },
+        { label: "速度", value: "1 MB/s" },
+        { label: "保存路径", value: "/downloads" },
+        { label: "文件路径", value: "/downloads/file.iso" },
+        { label: "GID", value: "gid-1" },
+        { label: "链接", value: "https://example.com/file.iso" },
+        { label: "创建时间", value: "2026-07-06 10:00" },
+        { label: "更新时间", value: "2026-07-06 10:01" },
+        { label: "错误原因", value: "网络断开" },
+      ],
+      ...overrides.details,
+    },
+    confirmTexts: {
+      redownloadTitle: "重新下载",
+      redownloadConfirmText: "确认重新下载",
+      restoreTitle: "恢复下载任务",
+      restoreConfirmText: "确认恢复",
+      deleteTitle: "删除任务",
+      deleteConfirmText: "确认删除",
+      deleteFilesLabel: "同时删除本地文件",
+      permanentDeleteTitle: "永久删除",
+      permanentDeleteConfirmText: "确认永久删除",
+      ...overrides.confirmTexts,
+    },
+    fileActions: overrides.fileActions,
+  };
+
+  const mounted = mountWithPinia(TaskActions, { props });
+
+  return {
+    props,
+    ...mounted,
+  };
+}
+
+function createTask(overrides: Partial<DownloadTask> = {}): DownloadTask {
+  return {
+    id: 1,
+    url: "https://example.com/file.iso",
+    sourceType: "url",
+    fileName: "file.iso",
+    saveDir: "/downloads",
+    category: "默认",
+    gid: "gid-1",
+    status: "active",
+    totalLength: 100,
+    completedLength: 20,
+    downloadSpeed: 10,
+    errorCode: null,
+    errorMessage: null,
+    filePath: "/downloads/file.iso",
+    useProxy: false,
+    confirmationRequired: false,
+    files: [],
+    createdAt: 1,
+    updatedAt: 2,
+    ...overrides,
+  };
+}
+
+async function clickButton(wrapper: ReturnType<typeof mountTaskActions>["wrapper"], text: string, index = 0) {
+  const matches = wrapper.findAll("button").filter((item) => item.text() === text || item.attributes("aria-label") === text);
+  const normalizedIndex = index >= 0 ? index : matches.length + index;
+  const button = matches[normalizedIndex];
+
+  expect(button, `button ${text} at index ${index} should exist`).toBeTruthy();
+  await button!.trigger("click");
+  await flushPromises();
+}
+
+function findIconButton(wrapper: ReturnType<typeof mountTaskActions>["wrapper"], label: string) {
+  return wrapper.find(`button[aria-label="${label}"]`);
+}
+
+async function clickIconButton(wrapper: ReturnType<typeof mountTaskActions>["wrapper"], label: string) {
+  const button = findIconButton(wrapper, label);
+  expect(button.exists(), `icon button ${label} should exist`).toBe(true);
+  await button.trigger("click");
+  await flushPromises();
+}

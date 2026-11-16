@@ -1,0 +1,90 @@
+pub mod aria2_rpc;
+pub mod file_context;
+pub mod files;
+pub mod model;
+pub mod operation;
+pub mod options;
+pub mod prepare;
+pub mod progress;
+pub mod public;
+mod refresh;
+pub mod repository;
+pub mod service;
+pub mod session;
+pub mod state;
+mod status;
+
+use crate::config::aria2::Aria2Config;
+use crate::debug_logs::DebugLogStore;
+pub(crate) use aria2_rpc::task_exists;
+pub use aria2_rpc::{
+    add_torrent_to_aria2, add_uri_to_aria2, change_task_options,
+    change_task_options_with_request_id, get_task_options, pause_task, pause_task_with_request_id,
+    remove_task, remove_task_with_request_id, unpause_task, unpause_task_with_request_id,
+    Aria2TaskCreationError, Aria2TaskOptionError,
+};
+pub(crate) use aria2_rpc::{
+    is_aria2_outcome_unknown_error, remove_task_result, tell_active_task_activity, tell_status,
+};
+pub use file_context::{task_file_actions, TaskFileActions, TaskFileAvailability};
+pub use files::{delete_task_files, validate_task_files};
+pub use model::{
+    is_pending_magnet_metadata_task, should_pause_task_on_exit, CreateDownloadTaskRequest,
+    CreateTaskAdvancedOptions, CreateTorrentDownloadTaskRequest, DownloadTask, DownloadTaskFile,
+    DownloadTaskSourceType, DownloadTaskStartMode, DownloadTaskStatus, PreparedDownloadTask,
+    SensitiveProxyUrl, TaskProxyBinding, TaskProxySource, DEFAULT_TASK_CATEGORY,
+};
+pub use operation::{
+    Aria2TaskRequest, TaskOperation, TaskOperationContext, TaskOperationStatus, TaskOperationType,
+};
+pub use options::{sanitize_aria2_options, sanitize_create_task_options};
+pub use prepare::{
+    default_download_dir_string, prepare_task, prepare_task_with_logs,
+    prepare_torrent_task_with_logs,
+};
+pub(crate) use prepare::{validate_url_output_file_name, INVALID_URL_OUTPUT_FILE_NAME};
+use progress::{apply_aria2_status_by_gid, is_aria2_status_error, parse_aria2_u64};
+pub use public::PublicDownloadTask;
+pub use refresh::{
+    is_stale_aria2_gid_error, refresh_tasks_from_aria2, sync_task_progress_after_pause_by_gid,
+    sync_task_progress_from_aria2_by_gid,
+};
+pub(crate) use session::find_aria2_task_for_request;
+pub(crate) use session::validate_url_task_output_before_resume;
+pub use session::{
+    reconcile_session_task_proxies, reconcile_task_proxy_option, sync_session_tasks_from_aria2,
+};
+use state::should_refresh_task;
+pub use state::{
+    list_tasks, mark_task_files_confirmed, mark_task_paused, mark_task_paused_by_gid,
+    mark_task_redownloaded, mark_task_removed, mark_task_restored, mark_task_resumed,
+    mark_unfinished_tasks_paused, remove_task_record, replace_task_snapshot,
+    set_task_metadata_torrent_path, store_created_task, store_created_task_with_id, task_gid,
+    task_snapshot, update_task_proxy_state, TaskMemoryState,
+};
+use status::Aria2TaskStatus;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn log_info(debug_logs: Option<&DebugLogStore>, module: &str, message: impl Into<String>) {
+    if let Some(debug_logs) = debug_logs {
+        debug_logs.info(module, message);
+    }
+}
+
+fn log_error(debug_logs: Option<&DebugLogStore>, module: &str, message: impl Into<String>) {
+    if let Some(debug_logs) = debug_logs {
+        debug_logs.error(module, message);
+    }
+}
+
+pub(crate) use crate::debug_logs::redact_url_for_log;
+
+#[cfg(test)]
+mod tests;

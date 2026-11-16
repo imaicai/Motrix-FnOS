@@ -1,0 +1,576 @@
+use crate::aria2::Aria2RpcClient;
+use crate::config::aria2::Aria2Config;
+use crate::debug_logs::DebugLogStore;
+use crate::runtime::Aria2LifecycleCoordinator;
+use crate::state::ShutdownState;
+use crate::tasks::files::{
+    cleanup_empty_torrent_task_dir, read_saved_torrent_metadata, remove_restore_metadata,
+    save_restore_torrent_metadata, task_download_dir,
+};
+use crate::tasks::operation::FILE_CLEANUP_PENDING_PHASE;
+use crate::tasks::{
+    add_torrent_to_aria2, add_uri_to_aria2, find_aria2_task_for_request,
+    is_aria2_outcome_unknown_error, is_stale_aria2_gid_error, mark_task_files_confirmed,
+    mark_task_redownloaded, mark_task_removed, mark_task_restored, mark_task_resumed, pause_task,
+    pause_task_with_request_id, prepare_task_with_logs, prepare_torrent_task_with_logs,
+    reconcile_task_proxy_option, remove_task, remove_task_record, remove_task_result,
+    remove_task_with_request_id, replace_task_snapshot, set_task_metadata_torrent_path,
+    store_created_task_with_id, sync_task_progress_after_pause_by_gid,
+    sync_task_progress_from_aria2_by_gid, task_gid, task_snapshot, unpause_task,
+    unpause_task_with_request_id, validate_task_files, validate_url_task_output_before_resume,
+    Aria2TaskCreationError, Aria2TaskRequest, CreateDownloadTaskRequest, CreateTaskAdvancedOptions,
+    CreateTorrentDownloadTaskRequest, DownloadTask, DownloadTaskSourceType, DownloadTaskStartMode,
+    DownloadTaskStatus, PreparedDownloadTask, TaskMemoryState, TaskOperation, TaskOperationContext,
+    TaskOperationType,
+};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::repository::TaskRepository;
+
+mod control;
+mod create;
+mod delete;
+mod magnet;
+mod native_metadata;
+mod proxy;
+mod query;
+mod restore;
+
+#[derive(Clone, Copy)]
+pub struct RuntimeGuard<'a> {
+    shutdown: &'a ShutdownState,
+    compatibility: Option<&'a std::sync::Mutex<crate::app::compatibility::AppCompatibility>>,
+}
+
+impl<'a> RuntimeGuard<'a> {
+    pub fn new(shutdown: &'a ShutdownState) -> Self {
+        Self {
+            shutdown,
+            compatibility: None,
+        }
+    }
+
+    pub(crate) fn with_compatibility(
+        shutdown: &'a ShutdownState,
+        compatibility: &'a std::sync::Mutex<crate::app::compatibility::AppCompatibility>,
+    ) -> Self {
+        Self {
+            shutdown,
+            compatibility: Some(compatibility),
+        }
+    }
+
+    pub fn ensure_running(&self) -> Result<(), String> {
+        if self.shutdown.is_exiting() {
+            Err("应用正在退出，不能执行任务操作".to_string())
+        } else {
+            if let Some(compatibility) = self.compatibility {
+                compatibility
+                    .lock()
+                    .map_err(|_| "无法读取兼容状态")?
+                    .ensure_download_available()?;
+            }
+            Ok(())
+        }
+    }
+
+    pub fn is_exiting(&self) -> bool {
+        self.shutdown.is_exiting()
+    }
+}
+
+pub struct TaskService<'a> {
+    repository: Box<dyn TaskRepository + 'a>,
+    download_tasks: &'a TaskMemoryState,
+    next_task_id: &'a AtomicU64,
+    app_data_dir: &'a Path,
+    accessible_paths_path: &'a Path,
+    debug_logs: &'a DebugLogStore,
+    aria2_rpc: &'a Aria2RpcClient,
+    aria2_lifecycle: &'a std::sync::Arc<Aria2LifecycleCoordinator>,
+    proxy_update_lock: &'a tokio::sync::Mutex<()>,
+    runtime_guard: RuntimeGuard<'a>,
+}
+
+pub struct TaskServiceDependencies<'a> {
+    pub repository: Box<dyn TaskRepository + 'a>,
+    pub download_tasks: &'a TaskMemoryState,
+    pub next_task_id: &'a AtomicU64,
+    pub app_data_dir: &'a Path,
+    pub accessible_paths_path: &'a Path,
+    pub debug_logs: &'a DebugLogStore,
+    pub aria2_rpc: &'a Aria2RpcClient,
+    pub aria2_lifecycle: &'a std::sync::Arc<Aria2LifecycleCoordinator>,
+    pub proxy_update_lock: &'a tokio::sync::Mutex<()>,
+    pub runtime_guard: RuntimeGuard<'a>,
+}
+
+impl<'a> TaskService<'a> {
+    pub fn new(dependencies: TaskServiceDependencies<'a>) -> Self {
+        Self {
+            repository: dependencies.repository,
+            download_tasks: dependencies.download_tasks,
+            next_task_id: dependencies.next_task_id,
+            app_data_dir: dependencies.app_data_dir,
+            accessible_paths_path: dependencies.accessible_paths_path,
+            debug_logs: dependencies.debug_logs,
+            aria2_rpc: dependencies.aria2_rpc,
+            aria2_lifecycle: dependencies.aria2_lifecycle,
+            proxy_update_lock: dependencies.proxy_update_lock,
+            runtime_guard: dependencies.runtime_guard,
+        }
+    }
+
+    pub fn ensure_not_exiting(&self) -> Result<(), String> {
+        self.runtime_guard.ensure_running()
+    }
+
+    pub fn ensure_task_authorized(&self, task_id: u64) -> Result<(), String> {
+        let task = task_snapshot(self.download_tasks, task_id)?;
+        self.validate_task_authorization(&task)
+    }
+
+    fn accessible_paths(&self) -> Result<Vec<String>, String> {
+        crate::storage::load_accessible_paths(self.accessible_paths_path)
+            .map_err(|error| format!("读取当前目录授权失败：{error}"))
+    }
+
+    pub(super) fn validate_task_authorization(&self, task: &DownloadTask) -> Result<(), String> {
+        if crate::tasks::is_pending_magnet_metadata_task(task) {
+            return Ok(());
+        }
+        let accessible_paths = self.accessible_paths()?;
+        crate::storage::validate_task_save_dir(
+            Some(crate::tasks::files::task_download_dir(task)),
+            &accessible_paths,
+        )
+        .map_err(|error| format!("任务保存目录当前未获授权：{error:?}"))
+    }
+
+    pub(super) fn prepare_task_destination(&self, task: &DownloadTask) -> Result<(), String> {
+        let accessible_paths = self.accessible_paths()?;
+        crate::storage::validate_task_save_dir(
+            Some(crate::tasks::files::task_download_dir(task)),
+            &accessible_paths,
+        )
+        .map_err(|error| format!("任务保存目录当前未获授权：{error:?}"))?;
+        crate::storage::prepare_task_save_dir(
+            Some(crate::tasks::files::task_download_dir(task)),
+            &accessible_paths,
+        )
+        .map_err(|error| format!("准备任务保存目录失败：{error:?}"))
+    }
+
+    pub(super) fn prepare_task_restore_destination(
+        &self,
+        task: &DownloadTask,
+    ) -> Result<(), String> {
+        let accessible_paths = self.accessible_paths()?;
+        let task_dir = task_download_dir(task);
+        crate::storage::validate_task_save_dir(Some(task_dir), &accessible_paths)
+            .map_err(|error| format!("任务保存目录当前未获授权：{error:?}"))?;
+        let restore_dir = match task.source_type {
+            DownloadTaskSourceType::Url => Path::new(&task.save_dir),
+            DownloadTaskSourceType::Torrent | DownloadTaskSourceType::Magnet => Path::new(task_dir)
+                .parent()
+                .unwrap_or_else(|| Path::new(task_dir)),
+        };
+        crate::storage::prepare_task_save_dir(restore_dir.to_str(), &accessible_paths)
+            .map_err(|error| format!("准备任务文件恢复目录失败：{error:?}"))
+    }
+
+    pub async fn pause_unauthorized_tasks(&self, config: &Aria2Config) -> Result<bool, String> {
+        let accessible_paths = self.accessible_paths().unwrap_or_else(|error| {
+            self.debug_logs.error(
+                "storage.auth",
+                format!("授权快照不可读取，将按无授权目录处理：{}", error),
+            );
+            Vec::new()
+        });
+        let mut changed_any = false;
+        let mut errors = Vec::new();
+        for task in self.download_tasks.list()? {
+            if !matches!(
+                task.status,
+                DownloadTaskStatus::Pending | DownloadTaskStatus::Active
+            ) || crate::tasks::is_pending_magnet_metadata_task(&task)
+                || task.gid.as_deref().is_none_or(|gid| gid.trim().is_empty())
+                || crate::storage::validate_task_save_dir(
+                    Some(crate::tasks::files::task_download_dir(&task)),
+                    &accessible_paths,
+                )
+                .is_ok()
+            {
+                continue;
+            }
+            match self.pause_task_for_revocation(config, task.id).await {
+                Ok(updated) => changed_any |= updated != task,
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            Ok(changed_any)
+        } else {
+            Err(errors.join("；"))
+        }
+    }
+
+    pub(super) async fn begin_task_operation(
+        &self,
+        task_id: u64,
+        operation_type: TaskOperationType,
+        phase: impl Into<String>,
+        context: TaskOperationContext,
+    ) -> Result<TaskOperation, String> {
+        if self
+            .repository
+            .list_unfinished_operations()
+            .await?
+            .iter()
+            .any(|operation| operation.task_id == task_id)
+        {
+            return Err("该任务已有操作正在进行，请稍后重试".to_string());
+        }
+        let operation = TaskOperation::new(task_id, operation_type, phase, context);
+        self.repository.begin_operation(&operation).await?;
+        Ok(operation)
+    }
+
+    pub(super) async fn update_task_operation(
+        &self,
+        operation: &mut TaskOperation,
+        phase: impl Into<String>,
+        context: TaskOperationContext,
+    ) -> Result<(), String> {
+        operation.update_phase(phase, context);
+        self.repository.update_operation(operation).await
+    }
+
+    pub(super) async fn record_aria2_task_created(
+        &self,
+        operation: &mut TaskOperation,
+        gid: String,
+    ) -> Result<(), String> {
+        let mut context = operation.context.clone();
+        context.new_gid = Some(gid);
+        context
+            .completed_side_effects
+            .push("aria2_task_created".to_string());
+        self.update_task_operation(operation, "aria2_created", context)
+            .await
+    }
+
+    async fn prepare_aria2_task_request(
+        &self,
+        operation: &mut TaskOperation,
+        task: &PreparedDownloadTask,
+    ) -> Result<(), String> {
+        let mut context = operation.context.clone();
+        context.aria2_request = Some(Aria2TaskRequest {
+            request_id: operation.id.clone(),
+            source_url: task.url.clone(),
+            save_dir: task
+                .aria2_save_dir
+                .clone()
+                .unwrap_or_else(|| task.save_dir.clone()),
+            file_name: task.file_name.clone(),
+        });
+        self.update_task_operation(operation, "aria2_request_prepared", context)
+            .await
+    }
+
+    pub(super) async fn add_uri_for_task_operation(
+        &self,
+        config: &Aria2Config,
+        operation: &mut TaskOperation,
+        task: &PreparedDownloadTask,
+    ) -> Result<String, String> {
+        self.prepare_aria2_task_request(operation, task).await?;
+        self.validate_prepared_task_save_dir(task)?;
+        let request_id = operation.id.clone();
+        match add_uri_to_aria2(
+            self.aria2_rpc,
+            config,
+            task,
+            Some(&request_id),
+            Some(self.debug_logs),
+        )
+        .await
+        {
+            Ok(gid) => Ok(gid),
+            Err(error) if error.is_outcome_unknown() => {
+                self.reconcile_unknown_aria2_task_creation(config, operation, error)
+                    .await
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub(super) async fn add_torrent_for_task_operation(
+        &self,
+        config: &Aria2Config,
+        operation: &mut TaskOperation,
+        task: &PreparedDownloadTask,
+        torrent_data: &[u8],
+    ) -> Result<String, String> {
+        self.prepare_aria2_task_request(operation, task).await?;
+        self.validate_prepared_task_save_dir(task)?;
+        let request_id = operation.id.clone();
+        match add_torrent_to_aria2(
+            self.aria2_rpc,
+            config,
+            task,
+            torrent_data,
+            Some(&request_id),
+            Some(self.debug_logs),
+        )
+        .await
+        {
+            Ok(gid) => Ok(gid),
+            Err(error) if error.is_outcome_unknown() => {
+                self.reconcile_unknown_aria2_task_creation(config, operation, error)
+                    .await
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn validate_prepared_task_save_dir(&self, task: &PreparedDownloadTask) -> Result<(), String> {
+        if let Some(aria2_save_dir) = task.aria2_save_dir.as_deref() {
+            if task.source_type == DownloadTaskSourceType::Magnet
+                && Path::new(aria2_save_dir).starts_with(self.app_data_dir)
+            {
+                return Ok(());
+            }
+            return Err("Aria2 私有保存目录不在应用数据目录中".to_string());
+        }
+        let accessible_paths = self.accessible_paths()?;
+        crate::storage::validate_task_save_dir(Some(&task.save_dir), &accessible_paths)
+            .map_err(|error| format!("任务保存目录当前未获授权：{error:?}"))
+    }
+
+    async fn reconcile_unknown_aria2_task_creation(
+        &self,
+        config: &Aria2Config,
+        operation: &mut TaskOperation,
+        error: Aria2TaskCreationError,
+    ) -> Result<String, String> {
+        let Some(request) = operation.context.aria2_request.as_ref() else {
+            return Err(error.to_string());
+        };
+        let mut excluded_gids = match self.download_tasks.list() {
+            Ok(tasks) => tasks
+                .into_iter()
+                .filter_map(|task| task.gid)
+                .collect::<BTreeSet<_>>(),
+            Err(list_error) => {
+                let message = format!("{}；读取现有任务以核对未知结果失败：{}", error, list_error);
+                self.record_unknown_aria2_outcome(operation, message.clone())
+                    .await?;
+                return Err(message);
+            }
+        };
+        if let Some(old_gid) = operation.context.old_gid.as_ref() {
+            excluded_gids.insert(old_gid.clone());
+        }
+        match find_aria2_task_for_request(
+            self.aria2_rpc,
+            config,
+            request,
+            &excluded_gids,
+            Some(self.debug_logs),
+        )
+        .await
+        {
+            // 调用方会将确认的 GID 与后续任务状态在同一条既有流程中持久化，
+            // 此处只返回对账结果，避免重复记录 `aria2_task_created` 副作用。
+            Ok(Some(gid)) => Ok(gid),
+            Ok(None) => {
+                self.record_unknown_aria2_outcome(operation, error.to_string())
+                    .await?;
+                Err(error.to_string())
+            }
+            Err(reconcile_error) => {
+                let message = format!("{}；即时对账失败：{}", error, reconcile_error);
+                self.record_unknown_aria2_outcome(operation, message.clone())
+                    .await?;
+                Err(message)
+            }
+        }
+    }
+
+    pub(super) async fn record_unknown_aria2_outcome(
+        &self,
+        operation: &mut TaskOperation,
+        error: String,
+    ) -> Result<(), String> {
+        let mut context = operation.context.clone();
+        context
+            .completed_side_effects
+            .push("aria2_request_outcome_unknown".to_string());
+        operation.error_message = Some(error);
+        self.update_task_operation(operation, "aria2_outcome_unknown", context)
+            .await
+    }
+
+    pub(super) fn has_unknown_aria2_outcome(&self, operation: &TaskOperation) -> bool {
+        operation.phase == "aria2_outcome_unknown"
+    }
+
+    pub(super) async fn persist_task_with_operation(
+        &self,
+        task: &DownloadTask,
+        operation: &mut TaskOperation,
+        phase: impl Into<String>,
+    ) -> Result<(), String> {
+        let mut context = operation.context.clone();
+        context
+            .completed_side_effects
+            .push("task_state_persisted".to_string());
+        operation.update_phase(phase, context);
+        self.repository
+            .persist_task_state_with_operation(task, operation)
+            .await
+    }
+
+    pub(super) async fn fail_task_operation(
+        &self,
+        operation: &mut TaskOperation,
+        phase: impl Into<String>,
+        error: impl Into<String>,
+    ) {
+        operation.fail(phase, error);
+        if let Err(update_error) = self.repository.update_operation(operation).await {
+            self.debug_logs.error(
+                "tasks.operation",
+                format!(
+                    "记录失败任务操作失败，operationId {}：{}",
+                    operation.id, update_error
+                ),
+            );
+        }
+    }
+
+    pub(super) async fn complete_task_operation(
+        &self,
+        operation: &mut TaskOperation,
+        phase: impl Into<String>,
+    ) {
+        operation.complete(phase);
+        if let Err(error) = self.repository.update_operation(operation).await {
+            self.debug_logs.warn(
+                "tasks.operation",
+                format!(
+                    "任务已完成但操作记录未能标记完成，operationId {}：{}",
+                    operation.id, error
+                ),
+            );
+        }
+    }
+
+    pub(super) async fn rollback_task_operation_state(
+        &self,
+        snapshot: DownloadTask,
+        operation: &mut TaskOperation,
+        phase: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> String {
+        let reason = reason.into();
+        let mut errors = vec![reason.clone()];
+        if let Err(error) = replace_task_snapshot(self.download_tasks, snapshot.clone()) {
+            errors.push(format!("恢复内存任务状态失败：{}", error));
+        }
+        operation.fail(phase, reason);
+        if let Err(error) = self
+            .repository
+            .persist_task_state_with_operation(&snapshot, operation)
+            .await
+        {
+            errors.push(format!("恢复数据库任务状态失败：{}", error));
+            self.fail_task_operation(operation, "rollback_persist_failed", errors.join("；"))
+                .await;
+        }
+        errors.join("；")
+    }
+
+    pub fn list_download_task_snapshot(&self) -> Result<Vec<DownloadTask>, String> {
+        query::list_download_task_snapshot(self)
+    }
+
+    pub fn list_removed_download_tasks(&self) -> Result<Vec<DownloadTask>, String> {
+        query::list_removed_download_tasks(self)
+    }
+
+    pub fn get_download_task(&self, task_id: u64) -> Result<Option<DownloadTask>, String> {
+        query::get_download_task(self, task_id)
+    }
+
+    fn ensure_task_engine_compatible(&self, task_id: u64) -> Result<(), String> {
+        let task = task_snapshot(self.download_tasks, task_id)?;
+        if task.engine_generation != crate::config::aria2::EngineGeneration::NativeV2 {
+            return Err(
+                "task_engine_incompatible：任务与当前引擎代际不兼容，旧记录仅供查看".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_task_generation_writable(&self, task_id: u64) -> Result<(), String> {
+        if let Some(compatibility) = self.runtime_guard.compatibility {
+            let generation = compatibility
+                .lock()
+                .map_err(|_| "无法读取兼容状态")?
+                .engine_generation;
+            let task = task_snapshot(self.download_tasks, task_id)?;
+            if matches!(
+                generation,
+                crate::config::aria2::EngineGeneration::NativeV2
+                    | crate::config::aria2::EngineGeneration::Unknown
+            ) && (task.engine_generation == crate::config::aria2::EngineGeneration::Unknown
+                || task.engine_generation != generation)
+            {
+                return Err("task_engine_incompatible：旧版任务仅供查看".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_file_cleanup_not_pending(&self, task_id: u64) -> Result<(), String> {
+        let pending = self
+            .repository
+            .list_unfinished_operations()
+            .await?
+            .into_iter()
+            .any(|operation| operation.task_id == task_id && operation.is_file_cleanup_pending());
+        if pending {
+            return Err(format!(
+                "任务文件仍在后台清理，暂不能执行此操作（{}）",
+                FILE_CLEANUP_PENDING_PHASE
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn task_operation_context(
+    task_snapshot: Option<DownloadTask>,
+    critical_paths: Vec<String>,
+) -> TaskOperationContext {
+    TaskOperationContext {
+        engine_generation: task_snapshot.as_ref().map(|task| task.engine_generation),
+        old_gid: task_snapshot.as_ref().and_then(|task| task.gid.clone()),
+        new_gid: None,
+        aria2_request: None,
+        critical_paths,
+        file_cleanup_paths: Vec::new(),
+        completed_side_effects: Vec::new(),
+        proxy_enabled: None,
+        task_snapshot,
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,33 @@
+[
+  {
+    "stepTitle": "${wizard.upgrade_title}",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "${wizard.upgrade_compatibility_help}"
+      },
+      {
+        "type": "tips",
+        "helpText": "${wizard.upgrade_backup_help}"
+      },
+      {
+        "type": "checkbox",
+        "field": "wizard_upgrade_acknowledged",
+        "label": "${wizard.upgrade_ack_label}",
+        "options": [
+          {
+            "label": "${wizard.upgrade_ack_option}",
+            "value": "true"
+          }
+        ],
+        "rules": [
+          {
+            "type": "array",
+            "required": true,
+            "message": "${wizard.upgrade_ack_required}"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,139 @@
+import { t } from "../i18n";
+
+export interface ApiErrorResponse {
+  code: string;
+  message: string;
+  reason?: string;
+}
+
+export class ApiError extends Error {
+  code: string;
+  status: number;
+  reason?: string;
+
+  constructor(status: number, payload: ApiErrorResponse) {
+    super(payload.message || t("server.httpFailed", { status }));
+    this.name = "ApiError";
+    this.code = payload.code;
+    this.status = status;
+    this.reason = payload.reason;
+  }
+}
+
+export interface HttpRequestOptions {
+  handleUnauthorized?: boolean;
+  includeAuth?: boolean;
+  signal?: AbortSignal;
+}
+
+interface RequestOptions extends HttpRequestOptions {
+  body?: unknown;
+  rawBody?: BodyInit;
+  headers?: HeadersInit;
+  responseType?: "blob";
+}
+
+let accessTokenProvider: (() => string | null) | null = null;
+let unauthorizedHandler: ((requestToken: string | null) => void | Promise<void>) | null = null;
+let handlingUnauthorizedToken: string | null | undefined;
+
+export function setAccessTokenProvider(provider: (() => string | null) | null) {
+  accessTokenProvider = provider;
+}
+
+export function setUnauthorizedHandler(
+  handler: ((requestToken: string | null) => void | Promise<void>) | null,
+) {
+  unauthorizedHandler = handler;
+}
+
+async function request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
+  const hasJsonBody = options.body !== undefined;
+  const accessToken = options.includeAuth === false ? null : accessTokenProvider?.() ?? null;
+  const response = await fetch(path, {
+    method,
+    // Preserve same-origin gateway cookies; Motrix itself authenticates with Bearer JWT.
+    credentials: "same-origin",
+    headers: {
+      ...(hasJsonBody ? { "content-type": "application/json" } : {}),
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      ...options.headers,
+    },
+    body: options.rawBody ?? (hasJsonBody ? JSON.stringify(options.body) : undefined),
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  if (!response.ok) {
+    const contentType = response.headers.get("content-type") || "";
+    const isJson = contentType.includes("application/json");
+    const payload = isJson ? ((await response.json()) as unknown) : await response.text();
+    const errorPayload = isApiErrorResponse(payload)
+      ? payload
+      : {
+          code: "http_error",
+          message: typeof payload === "string" && payload ? payload : t("server.httpFailed", { status: response.status }),
+        };
+    const error = new ApiError(response.status, errorPayload);
+    if (
+      response.status === 401 &&
+      options.handleUnauthorized !== false &&
+      unauthorizedHandler &&
+      accessToken === (accessTokenProvider?.() ?? null) &&
+      handlingUnauthorizedToken !== accessToken
+    ) {
+      const handler = unauthorizedHandler;
+      handlingUnauthorizedToken = accessToken;
+      try {
+        await handler(accessToken);
+      } finally {
+        if (handlingUnauthorizedToken === accessToken) handlingUnauthorizedToken = undefined;
+      }
+    }
+    throw error;
+  }
+
+  if (options.responseType === "blob") {
+    return (await response.blob()) as T;
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json") ? ((await response.json()) as unknown) : await response.text();
+  return payload as T;
+}
+
+function isApiErrorResponse(payload: unknown): payload is ApiErrorResponse {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  const candidate = payload as Record<string, unknown>;
+  return typeof candidate.code === "string" && typeof candidate.message === "string";
+}
+
+export function httpGet<T>(path: string, options: HttpRequestOptions = {}) {
+  return request<T>("GET", path, options);
+}
+
+export function httpGetBlob(path: string, options: HttpRequestOptions = {}) {
+  return request<Blob>("GET", path, { ...options, responseType: "blob" });
+}
+
+export function httpPost<T>(path: string, body?: unknown, options: HttpRequestOptions = {}) {
+  return request<T>("POST", path, { body, ...options });
+}
+
+export function httpPostFormData<T>(path: string, formData: FormData, options: HttpRequestOptions = {}) {
+  return request<T>("POST", path, { rawBody: formData, ...options });
+}
+
+export function httpPut<T>(path: string, body: unknown, options: HttpRequestOptions = {}) {
+  return request<T>("PUT", path, { body, ...options });
+}
+
+export function httpDelete<T>(path: string, options: HttpRequestOptions = {}) {
+  return request<T>("DELETE", path, options);
+}

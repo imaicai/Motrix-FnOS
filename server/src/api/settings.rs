@@ -1,0 +1,354 @@
+use crate::api::error::ApiError;
+use crate::api::extract::ApiJson;
+use crate::app::HttpAppState;
+use crate::settings::proxy::{
+    delete_download_proxy_for_engine, load_download_proxy_status, update_download_proxy,
+    DownloadProxyMutationResponse, DownloadProxyServiceContext, DownloadProxyServiceError,
+    DownloadProxyStatus,
+};
+use crate::settings::service::{
+    update_app_config, update_lan_json_rpc_config, update_public_rpc_token, AppConfig,
+    AppConfigUpdateError, LanJsonRpcConfig, LanJsonRpcUpdate, LanJsonRpcUpdateError,
+    RuntimeApplyStatus,
+};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+pub fn routes() -> Router<Arc<HttpAppState>> {
+    Router::new()
+        .route("/settings", get(get_settings).put(update_settings))
+        .route(
+            "/settings/jsonrpc-token",
+            get(get_json_rpc_token).put(update_json_rpc_token),
+        )
+        .route(
+            "/settings/lan-jsonrpc",
+            get(get_lan_json_rpc).put(update_lan_json_rpc),
+        )
+        .route(
+            "/settings/lan-jsonrpc/token",
+            post(rotate_lan_json_rpc_token),
+        )
+        .route(
+            "/settings/proxy",
+            get(get_download_proxy)
+                .put(put_download_proxy)
+                .delete(clear_download_proxy),
+        )
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JsonRpcTokenStatus {
+    pub configured: bool,
+    pub masked_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateJsonRpcTokenRequest {
+    token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LanJsonRpcStatus {
+    pub enabled: bool,
+    pub available: bool,
+    pub configured: bool,
+    pub masked_token: Option<String>,
+    pub allow_shared_address_space: bool,
+    pub port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateLanJsonRpcRequest {
+    enabled: bool,
+    allow_shared_address_space: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LanJsonRpcMutationResponse {
+    pub status: LanJsonRpcStatus,
+    pub issued_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateSettingsResponse {
+    #[serde(flatten)]
+    pub config: AppConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_apply: Option<RuntimeApplyStatus>,
+}
+
+async fn get_settings(State(state): State<Arc<HttpAppState>>) -> Result<Json<AppConfig>, ApiError> {
+    Ok(Json(state.current_app_config().await))
+}
+
+async fn get_download_proxy(
+    State(state): State<Arc<HttpAppState>>,
+) -> Result<Json<DownloadProxyStatus>, ApiError> {
+    load_download_proxy_status(&state.core.database.pool, &state.aria2_lifecycle)
+        .await
+        .map(Json)
+        .map_err(classify_download_proxy_error)
+}
+
+async fn put_download_proxy(
+    State(state): State<Arc<HttpAppState>>,
+    ApiJson(payload): ApiJson<serde_json::Value>,
+) -> Result<Json<DownloadProxyMutationResponse>, ApiError> {
+    let (proxy_url, bt_use_proxy) = parse_download_proxy_update(payload)?;
+    let aria2_config = state.aria2_runtime_snapshot().map(|_| state.aria2_config());
+    let task_service = state.task_service();
+    update_download_proxy(
+        DownloadProxyServiceContext {
+            pool: &state.core.database.pool,
+            tasks: &state.core.download_tasks,
+            aria2_lifecycle: &state.aria2_lifecycle,
+            aria2_rpc: &state.aria2_rpc,
+            aria2_config,
+            debug_logs: &state.core.debug_logs,
+            update_lock: &state.download_proxy_update_lock,
+            task_service: Some(&task_service),
+        },
+        proxy_url.as_deref(),
+        bt_use_proxy,
+    )
+    .await
+    .map(Json)
+    .map_err(classify_download_proxy_error)
+}
+
+async fn clear_download_proxy(
+    State(state): State<Arc<HttpAppState>>,
+) -> Result<StatusCode, ApiError> {
+    delete_download_proxy_for_engine(
+        &state.core.database.pool,
+        &state.core.download_tasks,
+        &state.download_proxy_update_lock,
+        &state.core.debug_logs,
+        Some(crate::config::aria2::EngineGeneration::NativeV2),
+    )
+    .await
+    .map(|()| StatusCode::NO_CONTENT)
+    .map_err(classify_download_proxy_error)
+}
+
+async fn update_settings(
+    State(state): State<Arc<HttpAppState>>,
+    ApiJson(payload): ApiJson<serde_json::Value>,
+) -> Result<Json<UpdateSettingsResponse>, ApiError> {
+    let payload = crate::settings::service::parse_app_config_request(payload)
+        .map_err(classify_settings_save_error)?;
+    let (config, runtime_apply) =
+        update_app_config(&state, payload)
+            .await
+            .map_err(|error| match error {
+                AppConfigUpdateError::AccessiblePaths(message) => {
+                    ApiError::internal("accessible_paths_load_failed", message)
+                }
+                AppConfigUpdateError::Save(message) => classify_settings_save_error(message),
+            })?;
+    Ok(Json(UpdateSettingsResponse {
+        config,
+        runtime_apply: Some(runtime_apply),
+    }))
+}
+
+async fn get_json_rpc_token(
+    State(state): State<Arc<HttpAppState>>,
+) -> Result<Json<JsonRpcTokenStatus>, ApiError> {
+    Ok(Json(json_rpc_token_status(&state.json_rpc_token())))
+}
+
+async fn get_lan_json_rpc(State(state): State<Arc<HttpAppState>>) -> Json<LanJsonRpcStatus> {
+    let config = state.lan_json_rpc_config().await;
+    Json(lan_json_rpc_status(&state, &config))
+}
+
+async fn update_lan_json_rpc(
+    State(state): State<Arc<HttpAppState>>,
+    ApiJson(payload): ApiJson<UpdateLanJsonRpcRequest>,
+) -> Result<Json<LanJsonRpcMutationResponse>, ApiError> {
+    let (persisted, issued_token) = update_lan_json_rpc_config(
+        &state,
+        LanJsonRpcUpdate::Settings {
+            enabled: payload.enabled,
+            allow_shared_address_space: payload.allow_shared_address_space,
+        },
+    )
+    .await
+    .map_err(|error| classify_lan_json_rpc_error(error, "lan_jsonrpc_save_failed"))?;
+    Ok(Json(LanJsonRpcMutationResponse {
+        status: lan_json_rpc_status(&state, &persisted),
+        issued_token,
+    }))
+}
+
+async fn rotate_lan_json_rpc_token(
+    State(state): State<Arc<HttpAppState>>,
+) -> Result<Json<LanJsonRpcMutationResponse>, ApiError> {
+    let (persisted, issued_token) =
+        update_lan_json_rpc_config(&state, LanJsonRpcUpdate::RotateToken)
+            .await
+            .map_err(|error| classify_lan_json_rpc_error(error, "lan_jsonrpc_token_save_failed"))?;
+    Ok(Json(LanJsonRpcMutationResponse {
+        status: lan_json_rpc_status(&state, &persisted),
+        issued_token,
+    }))
+}
+
+async fn update_json_rpc_token(
+    State(state): State<Arc<HttpAppState>>,
+    ApiJson(payload): ApiJson<UpdateJsonRpcTokenRequest>,
+) -> Result<Json<JsonRpcTokenStatus>, ApiError> {
+    let token = update_public_rpc_token(&state, &payload.token)
+        .await
+        .map_err(|error| ApiError::internal("jsonrpc_token_save_failed", error))?;
+    Ok(Json(json_rpc_token_status(&token)))
+}
+
+fn json_rpc_token_status(token: &str) -> JsonRpcTokenStatus {
+    if token.is_empty() {
+        return JsonRpcTokenStatus {
+            configured: false,
+            masked_token: None,
+        };
+    }
+    let chars = token.chars().collect::<Vec<_>>();
+    let suffix = if chars.len() >= 8 {
+        chars[chars.len() - 4..].iter().collect::<String>()
+    } else {
+        String::new()
+    };
+    JsonRpcTokenStatus {
+        configured: true,
+        masked_token: Some(format!("••••••••{suffix}")),
+    }
+}
+
+fn lan_json_rpc_status(state: &HttpAppState, config: &LanJsonRpcConfig) -> LanJsonRpcStatus {
+    let token = json_rpc_token_status(&config.token);
+    LanJsonRpcStatus {
+        enabled: config.enabled,
+        available: state.lan_jsonrpc_available(),
+        configured: token.configured,
+        masked_token: token.masked_token,
+        allow_shared_address_space: config.allow_shared_address_space,
+        port: 17082,
+    }
+}
+
+fn classify_lan_json_rpc_error(error: LanJsonRpcUpdateError, save_code: &'static str) -> ApiError {
+    match error {
+        LanJsonRpcUpdateError::Generate(message) => {
+            ApiError::internal("lan_jsonrpc_token_generate_failed", message)
+        }
+        LanJsonRpcUpdateError::Save(message) => ApiError::internal(save_code, message),
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+fn classify_settings_save_error(error: String) -> ApiError {
+    for code in [
+        "settings_connections_invalid",
+        "settings_option_conflict",
+        "settings_option_unsupported",
+        "settings_save_failed",
+    ] {
+        if error.starts_with(code) {
+            return ApiError::bad_request(code, error);
+        }
+    }
+    if error.contains("默认下载目录") {
+        return ApiError::bad_request("settings_save_failed", error);
+    }
+    ApiError::internal("settings_save_failed", error)
+}
+
+fn classify_download_proxy_error(error: DownloadProxyServiceError) -> ApiError {
+    match error {
+        DownloadProxyServiceError::InvalidUrl(message) => {
+            ApiError::bad_request("proxy_invalid_url", message)
+        }
+        DownloadProxyServiceError::InUse => ApiError::conflict(
+            "proxy_in_use",
+            "BT 总代理或 HTTP 任务仍引用应用代理地址，不能清除",
+        ),
+        DownloadProxyServiceError::BtProxyNotConfigured => ApiError::bad_request(
+            "bt_proxy_not_configured",
+            "开启 BT 总代理前请先配置代理地址",
+        ),
+        DownloadProxyServiceError::BtProxyProtocolUnsupported => ApiError::bad_request(
+            "bt_proxy_protocol_unsupported",
+            "BT 总代理只支持 HTTP、SOCKS4 或 SOCKS5",
+        ),
+        DownloadProxyServiceError::BtProxyEngineUnsupported => ApiError::conflict(
+            "bt_proxy_engine_unsupported",
+            "BT 总代理需要使用已验证的 NativeV2 引擎",
+        ),
+        DownloadProxyServiceError::State(message) if message.contains("正在切换") => {
+            ApiError::conflict("proxy_runtime_transition", message)
+        }
+        DownloadProxyServiceError::Load(message) => {
+            ApiError::internal("proxy_load_failed", message)
+        }
+        DownloadProxyServiceError::Save(message) => {
+            ApiError::internal("proxy_save_failed", message)
+        }
+        DownloadProxyServiceError::State(message) => {
+            ApiError::internal("proxy_save_failed", message)
+        }
+    }
+}
+
+fn parse_download_proxy_update(
+    payload: serde_json::Value,
+) -> Result<(Option<String>, Option<bool>), ApiError> {
+    let Some(object) = payload.as_object() else {
+        return Err(ApiError::bad_request(
+            "proxy_update_invalid",
+            "代理设置请求必须是 JSON 对象",
+        ));
+    };
+    let has_proxy_url = object.contains_key("proxyUrl");
+    let has_bt_use_proxy = object.contains_key("btUseProxy");
+    if !has_proxy_url && !has_bt_use_proxy {
+        return Err(ApiError::bad_request(
+            "proxy_update_invalid",
+            "请至少提交 proxyUrl 或 btUseProxy",
+        ));
+    }
+    let proxy_url = if let Some(value) = object.get("proxyUrl") {
+        let Some(value) = value.as_str() else {
+            return Err(ApiError::bad_request(
+                "proxy_invalid_url",
+                "proxyUrl 必须是字符串；清除地址请使用 DELETE",
+            ));
+        };
+        Some(value.to_string())
+    } else {
+        None
+    };
+    let bt_use_proxy = if let Some(value) = object.get("btUseProxy") {
+        let Some(value) = value.as_bool() else {
+            return Err(ApiError::bad_request(
+                "bt_proxy_setting_invalid",
+                "btUseProxy 必须是布尔值",
+            ));
+        };
+        Some(value)
+    } else {
+        None
+    };
+    Ok((proxy_url, bt_use_proxy))
+}

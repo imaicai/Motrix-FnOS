@@ -1,0 +1,42 @@
+import { describe, expect, it } from "vitest";
+import {
+  buildTaskAdvancedOptions,
+  createTaskCreateFormState,
+  normalizeTaskCategory,
+  resetTaskCreateFormState,
+} from "./taskCreateFormModel";
+
+describe("taskCreateFormModel", () => {
+  it("creates and restores the form defaults", () => {
+    const form = createTaskCreateFormState();
+    expect(form).toMatchObject({
+      startMode: "now",
+      category: "",
+      connections: null,
+      downloadLimitKb: 0,
+      useProxy: false,
+    });
+    expect(buildTaskAdvancedOptions(form)).toEqual({
+      connections: null,
+      downloadLimitKb: 0,
+      useProxy: false,
+    });
+    form.urls = "https://example.com/file.iso";
+    form.category = "电影";
+
+    resetTaskCreateFormState(form);
+
+    expect(form).toEqual(createTaskCreateFormState());
+  });
+
+  it("normalizes blank category and preserves explicit per-task overrides", () => {
+    const form = createTaskCreateFormState();
+    form.connections = 8;
+    form.downloadLimitKb = 512;
+    form.useProxy = true;
+
+    expect(normalizeTaskCategory("  ")).toBe("默认");
+    expect(normalizeTaskCategory(" 电影 ")).toBe("电影");
+    expect(buildTaskAdvancedOptions(form)).toEqual({ connections: 8, downloadLimitKb: 512, useProxy: true });
+  });
+});

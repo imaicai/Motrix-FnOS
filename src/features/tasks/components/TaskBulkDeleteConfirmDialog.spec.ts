@@ -1,0 +1,193 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("naive-ui", async () => {
+  const { defineComponent, h } = await import("vue");
+
+  return {
+    NCheckbox: defineComponent({
+      props: { checked: Boolean, disabled: Boolean },
+      emits: ["update:checked"],
+      setup(props, { emit, slots }) {
+        return () => h("label", [h("input", {
+          type: "checkbox", checked: props.checked, disabled: props.disabled,
+          onChange: (event: Event) => emit("update:checked", (event.target as HTMLInputElement).checked),
+        }), slots.default?.()]);
+      },
+    }),
+    NModal: defineComponent({
+      name: "NModalStub",
+      props: {
+        show: {
+          type: Boolean,
+          default: false,
+        },
+      },
+      setup(props, { slots }) {
+        return () => (props.show ? h("div", { "data-test": "n-modal" }, slots.default?.()) : null);
+      },
+    }),
+    NCard: defineComponent({
+      name: "NCardStub",
+      setup(_, { slots }) {
+        return () =>
+          h("div", { "data-test": "n-card" }, [
+            ...(slots.default?.() ?? []),
+            ...(slots.footer?.() ?? []),
+          ]);
+      },
+    }),
+    NButton: defineComponent({
+      name: "NButtonStub",
+      props: {
+        disabled: {
+          type: Boolean,
+          default: false,
+        },
+      },
+      emits: ["click"],
+      setup(props, { emit, slots, attrs }) {
+        return () =>
+          h(
+            "button",
+            {
+              ...attrs,
+              disabled: props.disabled,
+              onClick: (event: MouseEvent) => {
+                if (!props.disabled) {
+                  emit("click", event);
+                }
+              },
+            },
+            slots.default?.(),
+          );
+      },
+    }),
+    NSpace: defineComponent({
+      name: "NSpaceStub",
+      setup(_, { slots }) {
+        return () => h("div", { "data-test": "n-space" }, slots.default?.());
+      },
+    }),
+  };
+});
+
+import TaskBulkDeleteConfirmDialog from "./TaskBulkDeleteConfirmDialog.vue";
+import { flushPromises, mountWithPinia } from "../../../test/mount";
+import { setLanguage } from "../../../i18n";
+
+describe("TaskBulkDeleteConfirmDialog", () => {
+  afterEach(() => {
+    setLanguage("zh-CN");
+  });
+
+  it("shows delete count when opened", () => {
+    const { wrapper } = mountWithPinia(TaskBulkDeleteConfirmDialog, {
+      props: {
+        show: true,
+        taskCount: 3,
+        canDeleteFiles: false,
+      },
+    });
+
+    expect(wrapper.text()).toContain("3");
+    expect(wrapper.text()).toContain("不会删除本地文件");
+  });
+
+  it("renders English delete count interpolation", () => {
+    setLanguage("en-US");
+    const { wrapper } = mountWithPinia(TaskBulkDeleteConfirmDialog, {
+      props: {
+        show: true,
+        taskCount: 12,
+        canDeleteFiles: false,
+      },
+    });
+
+    expect(wrapper.text()).toContain("Move 12 visible tasks to Trash?");
+    expect(wrapper.text()).toContain("Local files will not be deleted");
+  });
+
+  it("warns that clearing Trash permanently deletes all records", () => {
+    const { wrapper } = mountWithPinia(TaskBulkDeleteConfirmDialog, {
+      props: {
+        show: true,
+        taskCount: 4,
+        canDeleteFiles: true,
+        mode: "clearTrash",
+      },
+    });
+
+    expect(wrapper.text()).toContain("永久删除回收站中的 4 条任务记录");
+    expect(wrapper.text()).toContain("无法撤销");
+    expect(wrapper.text()).toContain("全部永久删除");
+  });
+
+  it("offers file deletion only for clearing Trash and resets it on reopen", async () => {
+    const { wrapper } = mountWithPinia(TaskBulkDeleteConfirmDialog, {
+      props: { show: true, taskCount: 2, canDeleteFiles: true },
+    });
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
+    await wrapper.setProps({ mode: "clearTrash" });
+    const checkbox = wrapper.get<HTMLInputElement>('input[type="checkbox"]');
+    expect(checkbox.element.checked).toBe(false);
+    await clickButton(wrapper, "全部永久删除");
+    expect(wrapper.emitted("confirm")).toEqual([[false]]);
+    await checkbox.setValue(true);
+    await clickButton(wrapper, "全部永久删除");
+    expect(wrapper.emitted("confirm")).toEqual([[false], [true]]);
+    await wrapper.setProps({ show: false });
+    await wrapper.setProps({ show: true });
+    expect(wrapper.get<HTMLInputElement>('input[type="checkbox"]').element.checked).toBe(false);
+  });
+
+  it("closes without confirming when canceled", async () => {
+    const { wrapper } = mountWithPinia(TaskBulkDeleteConfirmDialog, {
+      props: {
+        show: true,
+        taskCount: 2,
+        canDeleteFiles: false,
+      },
+    });
+
+    await clickButton(wrapper, "取消");
+
+    expect(wrapper.emitted("update:show")).toEqual([[false]]);
+    expect(wrapper.emitted("confirm")).toBeUndefined();
+  });
+
+  it("emits confirm when confirmed", async () => {
+    const { wrapper } = mountWithPinia(TaskBulkDeleteConfirmDialog, {
+      props: {
+        show: true,
+        taskCount: 2,
+        canDeleteFiles: false,
+      },
+    });
+
+    await clickButton(wrapper, "移入回收站");
+
+    expect(wrapper.emitted("confirm")).toHaveLength(1);
+  });
+
+  it("hides file deletion when no Trash task has eligible content and clears the old choice", async () => {
+    const { wrapper } = mountWithPinia(TaskBulkDeleteConfirmDialog, {
+      props: { show: true, taskCount: 2, mode: "clearTrash", canDeleteFiles: false },
+    });
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
+    await wrapper.setProps({ canDeleteFiles: true });
+    await wrapper.get('input[type="checkbox"]').setValue(true);
+    await wrapper.setProps({ canDeleteFiles: false });
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
+    await clickButton(wrapper, "全部永久删除");
+    expect(wrapper.emitted("confirm")).toEqual([[false]]);
+    await wrapper.setProps({ canDeleteFiles: true });
+    expect(wrapper.get<HTMLInputElement>('input[type="checkbox"]').element.checked).toBe(false);
+  });
+});
+
+async function clickButton(wrapper: ReturnType<typeof mountWithPinia>["wrapper"], text: string) {
+  const button = wrapper.findAll("button").find((item) => item.text() === text);
+  expect(button, `button ${text} should exist`).toBeTruthy();
+  await button!.trigger("click");
+  await flushPromises();
+}

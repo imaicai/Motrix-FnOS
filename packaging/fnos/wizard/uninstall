@@ -1,0 +1,17 @@
+[
+  {
+    "stepTitle": "${wizard.uninstall_title}",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "${wizard.uninstall_keep_help}"
+      },
+      {
+        "type": "switch",
+        "field": "MOTRIX_FNOS_DELETE_APP_DATA",
+        "label": "${wizard.uninstall_delete_label}",
+        "helpText": "${wizard.uninstall_delete_help}"
+      }
+    ]
+  }
+]

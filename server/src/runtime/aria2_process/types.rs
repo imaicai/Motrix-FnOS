@@ -1,0 +1,100 @@
+use crate::config::aria2::Aria2BinarySource;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::process::Child;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Aria2ProcessStatus {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub binary_source: Option<Aria2BinarySource>,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub struct ManagedAria2Process {
+    child: Child,
+    source: Aria2BinarySource,
+    pub(super) stop_requested: bool,
+}
+
+impl ManagedAria2Process {
+    pub fn new(child: Child, source: Aria2BinarySource) -> Self {
+        Self {
+            child,
+            source,
+            stop_requested: false,
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn source(&self) -> Aria2BinarySource {
+        self.source.clone()
+    }
+
+    pub(super) fn is_running(&mut self) -> Result<bool, String> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(|error| format!("读取 Aria2 进程状态失败：{}", error))
+    }
+
+    pub fn kill(&mut self) -> Result<(), String> {
+        self.child
+            .kill()
+            .map_err(|error| format!("停止 Aria2 进程句柄失败：{}", error))
+    }
+
+    pub(super) fn interrupt_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        // 持有未回收的 Child 身份，SIGINT 让引擎自行排空 I/O 和提交原生状态。
+        if !self.stop_requested {
+            if unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) } != 0 {
+                return Err(format!(
+                    "请求 Aria2 正常退出失败：{}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            self.stop_requested = true;
+        }
+        loop {
+            if self.native_stop_completed()? {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("Aria2 正常退出超时，无法确认原生状态提交，已保留运行态".to_string());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+
+    pub(super) fn native_stop_completed(&mut self) -> Result<bool, String> {
+        match self.child.try_wait() {
+            // 2.8.6 正常停机也返回任务结果；存储、配置、未知错误和信号退出仍失败关闭。
+            Ok(Some(status))
+                if self.stop_requested
+                    && matches!(
+                        status.code(),
+                        Some(0 | 2..=8 | 10..=13 | 19..=27 | 29 | 31..=32)
+                    ) =>
+            {
+                Ok(true)
+            }
+            Ok(Some(status)) => Err(format!("Aria2 异常退出（{status}），无法确认原生状态提交")),
+            Err(error) => Err(format!("等待 Aria2 正常退出失败：{error}")),
+            Ok(None) => Ok(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAria2Binary {
+    pub path: PathBuf,
+    pub source: Aria2BinarySource,
+}

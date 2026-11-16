@@ -1,0 +1,78 @@
+import { useMessage } from "naive-ui";
+import { formatDebugLogCategory } from "../utils/debugLogFormat";
+import type { Ref } from "vue";
+import { copyTextToClipboard } from "../../../app/utils/clipboard";
+import { formatDateTime, useI18n } from "../../../i18n";
+import type { DebugLogEntry } from "../types";
+
+interface UseDebugLogExportOptions {
+  logs: Ref<DebugLogEntry[]>;
+  filteredLogs: Ref<DebugLogEntry[]>;
+  warningCount: Ref<number>;
+  errorCount: Ref<number>;
+  onManualCopy: (text: string) => void;
+}
+
+export function useDebugLogExport({
+  logs,
+  filteredLogs,
+  warningCount,
+  errorCount,
+  onManualCopy,
+}: UseDebugLogExportOptions) {
+  const message = useMessage();
+  const { t } = useI18n();
+
+  async function copyAllLogs() {
+    if (filteredLogs.value.length === 0) {
+      message.warning(t("logs.noCopy"));
+      return;
+    }
+
+    const text = formatAllLogs();
+    const result = await copyTextToClipboard(text);
+    if (result.copied) {
+      message.success(t("logs.copied"));
+      return;
+    }
+
+    onManualCopy(text);
+    message.warning(t("common.clipboardManualCopy"));
+  }
+
+  function downloadAllLogs() {
+    if (filteredLogs.value.length === 0) {
+      message.warning(t("logs.noDownload"));
+      return;
+    }
+
+    const blob = new Blob([formatAllLogs()], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `motrix-fnos-debug-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    message.success(t("logs.exported"));
+  }
+
+  function formatAllLogs() {
+    const header = [
+      t("logs.exportTitle"),
+      t("logs.exportedAt", { time: formatDateTime(Date.now()) }),
+      `${t("logs.stats.total")}: ${logs.value.length}; ${t("logs.stats.filtered")}: ${filteredLogs.value.length}; ${t("logs.stats.warnings")}: ${warningCount.value}; ${t("logs.stats.errors")}: ${errorCount.value}`,
+      "",
+    ].join("\n");
+    return `${header}${filteredLogs.value.map(formatLogLine).join("\n")}`;
+  }
+
+  function formatLogLine(log: DebugLogEntry) {
+    const repeatCount = log.repeatCount ?? 1;
+    const repeats = repeatCount > 1 ? ` x${repeatCount} last=${formatDateTime(log.lastTimestampMs ?? log.timestampMs)}` : "";
+    return `[${formatDateTime(log.timestampMs)}] [${log.level.toUpperCase()}] [${formatDebugLogCategory(log.category)}] [${log.module}]${repeats} ${log.message}`;
+  }
+
+  return { copyAllLogs, downloadAllLogs, formatAllLogs };
+}

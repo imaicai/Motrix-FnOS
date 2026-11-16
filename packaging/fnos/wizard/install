@@ -1,0 +1,35 @@
+[
+  {
+    "stepTitle": "${wizard.install_title}",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "${wizard.install_help}"
+      },
+      {
+        "type": "password",
+        "field": "wizard_management_password",
+        "label": "${wizard.password_label}",
+        "rules": [
+          {
+            "min": 8,
+            "max": 128,
+            "message": "${wizard.password_length}"
+          }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_management_password_confirm",
+        "label": "${wizard.password_confirm_label}",
+        "rules": [
+          {
+            "min": 8,
+            "max": 128,
+            "message": "${wizard.password_length}"
+          }
+        ]
+      }
+    ]
+  }
+]

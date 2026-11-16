@@ -1,0 +1,47 @@
+<script setup lang="ts">
+import { NSpace } from "naive-ui";
+import AppConfirmDialog from "../../../components/ui/AppConfirmDialog.vue";
+import type { TaskActionState } from "./taskActionViewModel";
+import TaskProxyToggle from "./TaskProxyToggle.vue";
+
+withDefaults(defineProps<{
+  show: boolean;
+  state: TaskActionState;
+  title: string;
+  text: string;
+  confirmLabel: string;
+  useProxy: boolean;
+  showProxy?: boolean;
+}>(), { showProxy: true });
+
+const emit = defineEmits<{
+  "update:show": [show: boolean];
+  "update:useProxy": [enabled: boolean];
+  confirm: [useProxy: boolean];
+}>();
+</script>
+
+<template>
+  <AppConfirmDialog
+    :show="show"
+    :title="title"
+    :mask-closable="!state.isOperating"
+    :loading="state.isOperating"
+    :disabled="state.isActionDisabled"
+    confirm-type="primary"
+    @update:show="emit('update:show', $event)"
+    @confirm="emit('confirm', useProxy)"
+  >
+    <NSpace vertical>
+      <p>{{ text }}</p>
+      <TaskProxyToggle
+        v-if="showProxy !== false"
+        :value="useProxy"
+        :disabled="state.isActionDisabled"
+        :loading="state.isOperating"
+        @update:value="emit('update:useProxy', $event)"
+      />
+    </NSpace>
+    <template #confirm-label>{{ confirmLabel }}</template>
+  </AppConfirmDialog>
+</template>

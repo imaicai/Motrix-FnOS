@@ -1,0 +1,567 @@
+import { expect, test, type Page, type Route } from "@playwright/test";
+
+const password = "test-password-123";
+const accessToken = "e2e-access-token";
+const task = {
+  id: 1,
+  engineGeneration: "native-v2",
+  readOnly: false,
+  url: "https://example.test/file.iso",
+  sourceType: "url",
+  fileName: "file.iso",
+  saveDir: "/downloads",
+  ownedTaskDir: null,
+  category: "",
+  gid: "e2e-gid",
+  status: "paused",
+  totalLength: 1024,
+  completedLength: 0,
+  downloadSpeed: 0,
+  errorCode: null,
+  errorMessage: null,
+  filePath: null,
+  useProxy: false,
+  filesDeleted: false,
+  cleanupState: "none",
+  metadataState: "none",
+  confirmationRequired: false,
+  files: [],
+  createdAt: 1,
+  updatedAt: 1,
+};
+
+test.describe("browser smoke", () => {
+  for (const language of ["zh-CN", "en-US"] as const) {
+    for (const theme of ["dark", "light"] as const) {
+      test(`checks missing completed files before redownload in ${language} ${theme}`, async ({ page }, testInfo) => {
+        const fixture = await installFixture(page);
+        fixture.eventTasks = [{ ...task, status: "complete", completedLength: 1024 }];
+        let availability = "available";
+        let writes = 0;
+        await page.route("**/api/tasks/1/file-context*", (route) => json(route, 200, {
+          saveDir: { path: "/downloads", displayPath: "/downloads" }, filePath: null,
+          actions: { availability, fileManagerPath: null, openFilePath: null, detailPaths: [] },
+        }));
+        await page.route("**/api/tasks/1/redownload", async (route) => {
+          writes += 1;
+          fixture.eventTasks = [{ ...task, status: "active" }];
+          await json(route, 200, fixture.eventTasks[0]);
+        });
+        await completeLogin(page);
+        await page.evaluate(async ({ language, theme }) => {
+          const i18nModule = "/src/i18n/index.ts";
+          const themeModule = "/src/app/theme.ts";
+          const [{ setLanguage }, { setAppTheme }] = await Promise.all([import(i18nModule), import(themeModule)]);
+          setLanguage(language);
+          setAppTheme(theme);
+        }, { language, theme });
+        const chinese = language === "zh-CN";
+        const redownloadLabel = chinese ? "重新下载" : "Redownload";
+        const redownload = page.locator(".task-actions-container").getByRole("button", { name: redownloadLabel, exact: true });
+        const localStatus = page.locator(".task-local-file-status");
+        await expect(localStatus).toContainText(chinese ? "文件已准备就绪" : "Files are ready");
+        availability = "path_missing";
+        await redownload.click();
+        const dialog = page.getByRole("dialog");
+        await expect(dialog).toContainText(chinese ? "从 0 开始" : "starting from zero");
+        await expect(localStatus).toContainText(chinese ? "本地文件不存在" : "Local files are missing");
+        await expect(dialog).toHaveCSS("opacity", "1");
+        await expect(dialog).toHaveCSS("transform", "none");
+        await page.screenshot({ path: testInfo.outputPath("missing-files-redownload.png"), fullPage: true });
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+        await dialog.getByRole("button", { name: "取消", exact: true }).click();
+        await expect(dialog).toHaveCount(0);
+        expect(writes).toBe(0);
+        await expect(page.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+        await page.screenshot({ path: testInfo.outputPath("missing-files-status.png"), fullPage: true });
+
+        availability = "storage_unavailable";
+        await redownload.click();
+        await expect(dialog).toHaveCount(0);
+        await expect(localStatus).toContainText(chinese ? "存储不可用" : "Storage unavailable");
+        expect(writes).toBe(0);
+
+        availability = "partial_missing";
+        await redownload.click();
+        await expect(dialog).toContainText(chinese ? "清理剩余文件" : "remove the remaining files");
+        await expect(dialog).toHaveCSS("opacity", "1");
+        await expect(dialog).toHaveCSS("transform", "none");
+        await page.screenshot({ path: testInfo.outputPath("partial-files-redownload.png"), fullPage: true });
+        await dialog.getByRole("button", { name: redownloadLabel, exact: true }).click();
+        await expect.poll(() => writes).toBe(1);
+        await expect(dialog).toHaveCount(0);
+        await expect(localStatus).toHaveCount(0);
+      });
+    }
+  }
+
+  for (const locale of ["zh-CN", "en-GB", "fr-FR"]) {
+    test(`keeps automatic language before and after login with browser locale ${locale}`, async ({ page }, testInfo) => {
+      await installFixture(page);
+      await page.addInitScript((value) => Object.defineProperty(navigator, "language", { value }), locale);
+      await page.route("**/api/settings", (route) => json(route, 200, {
+        defaultDownloadDir: "/downloads", maxConcurrentDownloads: 5, downloadLimit: 0, uploadLimit: 0, language: "auto",
+      }));
+      await page.goto("/");
+      await expect(page.getByRole("heading", { name: locale === "zh-CN" ? "登录 Motrix" : "Sign in to Motrix" })).toBeVisible();
+      await page.locator('[data-test="auth-password"] input').fill(password);
+      await page.locator('[data-test="auth-submit"]').click();
+      await expect(page.locator(".window-shell")).toBeVisible();
+      await expect(page.getByText(locale === "zh-CN" ? "暂无任务" : "No tasks", { exact: true })).toBeVisible();
+      await expect(page.locator("html")).toHaveAttribute("lang", locale === "zh-CN" ? "zh-CN" : "en-US");
+      await page.screenshot({ path: testInfo.outputPath("automatic-language.png"), fullPage: true });
+    });
+  }
+
+  test("shows the login form and keeps diagnostics visible", async ({ page }, testInfo) => {
+    await installFixture(page);
+    await page.goto("/");
+    await expect(page.locator('[data-test="auth-password"]')).toBeVisible();
+    await expect(page.locator('[data-test="auth-password-confirm"]')).toHaveCount(0);
+    await expect(page.locator('[data-test="auth-bootstrap-token"]')).toHaveCount(0);
+    await expect(page.locator('[data-test="auth-copy-diagnostic"]')).toBeVisible();
+    await expect(page.locator('[data-test="auth-download-diagnostic"]')).toBeVisible();
+    await expect(page.locator("#app-bootstrap")).toHaveCount(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath("login.png"), fullPage: true });
+  });
+
+  test("keeps unconfigured installations protected and shows recovery diagnostics", async ({ page }, testInfo) => {
+    await installFixture(page);
+    await page.route("**/api/auth/status", (route) => json(route, 200, { setupRequired: true, authenticated: false }));
+    await page.goto("/");
+    await expect(page.locator('[data-test="auth-unconfigured"]')).toBeVisible();
+    await expect(page.locator('[data-test="auth-password"]')).toHaveCount(0);
+    await expect(page.locator(".window-shell")).toHaveCount(0);
+    await expect(page.locator('[data-test="auth-download-diagnostic"]')).toBeVisible();
+    await expect(page.locator("#app-bootstrap")).toHaveCount(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath("unconfigured.png"), fullPage: true });
+  });
+
+  test("logs in, opens task form, creates a URL task, and receives SSE snapshot", async ({ page }) => {
+    const fixture = await installFixture(page);
+
+    await page.goto("/");
+    await expect(page.locator('[data-test="auth-password"]')).toBeVisible();
+    await page.locator('[data-test="auth-password"] input').fill(password);
+    await page.locator('[data-test="auth-submit"]').click();
+
+    await expect(page.locator(".window-shell")).toBeVisible();
+    await expect.poll(() => fixture.eventRequests).toBeGreaterThan(0);
+    await expect(page.getByText("暂无任务")).toBeVisible();
+
+    await page.locator('button[aria-label="新建任务"]:visible, button[aria-label="添加任务"]:visible').first().click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    const dialog = page.getByRole("dialog");
+    await dialog.locator("textarea").fill("https://example.test/file.iso");
+    await dialog.locator(".n-base-selection").click();
+    await page.getByText("/downloads", { exact: true }).last().click({ force: true });
+    await dialog.getByRole("button", { name: "开始下载" }).click();
+
+    await expect.poll(() => fixture.createdUrls).toEqual(["https://example.test/file.iso"]);
+    await expect(page.getByText("file.iso", { exact: true })).toBeVisible();
+  });
+
+  for (const deleteFiles of [false, true]) {
+    test(`moves a task to Trash and permanently deletes it with deleteFiles=${deleteFiles}`, async ({ page }, testInfo) => {
+      const fixture = await installFixture(page);
+      fixture.createdUrls.push(task.url);
+      fixture.eventTasks = [{ ...task }];
+      let removed: (typeof task)[] = [];
+      let cleanupDone = false;
+      const deleteRequests: string[] = [];
+      await page.route("**/api/tasks**", async (route) => {
+        const url = new URL(route.request().url());
+        if (url.pathname === "/api/tasks" && url.searchParams.get("status") === "removed") {
+          await json(route, 200, cleanupDone ? [] : removed);
+        } else if (url.pathname === "/api/tasks/1" && route.request().method() === "DELETE") {
+          deleteRequests.push(url.pathname + url.search);
+          fixture.createdUrls = [];
+          fixture.eventTasks = [];
+          removed = [{ ...task, status: "removed" }];
+          await json(route, 200, removed[0]);
+        } else if (url.pathname === "/api/tasks/1/permanent") {
+          deleteRequests.push(url.pathname + url.search);
+          if (url.searchParams.get("deleteFiles") === "true") {
+            removed = [{ ...removed[0], cleanupState: "pending", filesDeleted: true }];
+            await json(route, 202, removed[0]);
+          } else {
+            removed = [];
+            await route.fulfill({ status: 204 });
+          }
+        } else {
+          await route.fallback();
+        }
+      });
+      await completeLogin(page);
+      await page.getByRole("button", { name: "移入回收站", exact: true }).click();
+      const dialog = page.getByRole("dialog");
+      await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+      await expect(dialog).toContainText("此操作不会释放磁盘空间");
+      await dialog.getByRole("button", { name: "移入回收站", exact: true }).click();
+      await expect(page.getByText("file.iso", { exact: true })).toHaveCount(0);
+      await page.getByRole("button", { name: "回收站", exact: true }).click();
+      await page.getByRole("button", { name: "永久删除", exact: true }).click();
+      const checkbox = dialog.getByRole("checkbox");
+      await expect(checkbox).not.toBeChecked();
+      if (deleteFiles) await checkbox.check();
+      await page.screenshot({ path: testInfo.outputPath("permanent-delete.png"), fullPage: true });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await dialog.getByRole("button", { name: "永久删除", exact: true }).click();
+      await expect(dialog).toHaveCount(0);
+      if (deleteFiles) {
+        await expect(page.getByText("文件清理中", { exact: true })).toBeVisible();
+        cleanupDone = true;
+      }
+      await expect(page.getByText("file.iso", { exact: true })).toHaveCount(0);
+      expect(deleteRequests).toEqual(["/api/tasks/1", `/api/tasks/1/permanent?deleteFiles=${deleteFiles}`]);
+    });
+  }
+
+  test("handles an expired API token by returning to the login gate", async ({ page }) => {
+    const fixture = await installFixture(page);
+    await completeLogin(page);
+    fixture.forceUnauthorized = true;
+
+    await page.reload();
+    await expect(page.locator('[data-test="auth-password"]')).toBeVisible();
+    await expect(page.locator('[data-test="auth-submit"]')).toBeVisible();
+  });
+
+  test("reconnects the SSE stream after the first connection closes", async ({ page }) => {
+    const fixture = await installFixture(page);
+    await completeLogin(page);
+
+    await expect.poll(() => fixture.eventRequests, { timeout: 6_000 }).toBeGreaterThan(1);
+  });
+
+  test("updates task progress from authenticated SSE snapshots without a page reload", async ({ page }) => {
+    const fixture = await installFixture(page);
+    fixture.eventTasks = [{ ...task, status: "active", completedLength: 256, downloadSpeed: 128 }];
+    const eventRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/events");
+    await completeLogin(page);
+
+    expect((await eventRequest).headers().authorization).toBe(`Bearer ${accessToken}`);
+    await expect(page.getByText("file.iso", { exact: true })).toBeVisible();
+    const progress = page.getByRole("progressbar");
+    await expect(progress).toHaveAttribute("aria-valuenow", "25");
+
+    fixture.eventTasks = [{ ...fixture.eventTasks[0], completedLength: 768 }];
+    await expect(progress).toHaveAttribute("aria-valuenow", "75", { timeout: 6_000 });
+
+    fixture.eventTasks = [{ ...fixture.eventTasks[0], completedLength: 512 }];
+    await expect(progress).toHaveAttribute("aria-valuenow", "50", { timeout: 6_000 });
+    await expect(page.locator('[data-test="task-size-metric"]')).toContainText("512 B / 1.0 KB");
+
+    fixture.eventTasks = [{ ...fixture.eventTasks[0], status: "paused" }];
+    await expect(page.locator('[data-test="task-speed-metric"]')).toContainText("--", { timeout: 6_000 });
+    await expect(page.locator('[data-test="task-eta-metric"]')).toContainText("--");
+  });
+
+  for (const language of ["zh-CN", "en-US"] as const) {
+    for (const theme of ["dark", "light"] as const) {
+      test(`keeps download metrics readable in ${language} with ${theme} theme`, async ({ page }, testInfo) => {
+        const fixture = await installFixture(page);
+        const gigabyte = 1024 ** 3;
+        const activeTask = {
+          ...task,
+          status: "active",
+          fileName: "中文与English_" + "release_candidate_assets_".repeat(5) + ".iso",
+          category: "电影",
+          totalLength: 100 * gigabyte,
+          completedLength: 25 * gigabyte,
+          downloadSpeed: 2 * 1024 ** 2,
+        };
+        fixture.eventTasks = [
+          activeTask,
+          { ...task, id: 2, gid: "unknown-size", fileName: "unknown-size.iso", status: "active", totalLength: 0, completedLength: 2048, downloadSpeed: 1024 },
+          { ...activeTask, id: 3, gid: "paused", fileName: "paused.iso", status: "paused" },
+          { ...activeTask, id: 4, gid: "complete", fileName: "complete.iso", status: "complete", completedLength: 100 * gigabyte },
+        ];
+        await completeLogin(page);
+        const metrics = page.locator(".task-card-meta");
+        await expect(metrics).toHaveCount(4);
+        await page.evaluate(async ({ language, theme }) => {
+          const themeModule = "/src/app/theme.ts";
+          const i18nModule = "/src/i18n/index.ts";
+          const [{ setAppTheme }, { setLanguage }] = await Promise.all([import(themeModule), import(i18nModule)]);
+          setAppTheme(theme);
+          setLanguage(language);
+        }, { language, theme });
+
+        for (const viewport of [{ width: 390, height: 844 }, { width: 1024, height: 768 }, { width: 1440, height: 900 }]) {
+          await page.setViewportSize(viewport);
+          await expect(metrics.first()).toBeVisible();
+          await expect(metrics.first()).toHaveClass(viewport.width < 768 ? /task-card-meta--grid/ : /task-card-meta--inline/);
+          await expect(metrics.first().locator('[data-test="task-eta-metric"]')).toContainText(
+            language === "zh-CN" ? "约 10小时 40分" : "About 10h 40m",
+          );
+          await expect(metrics.nth(1).locator('[data-test="task-size-metric"]')).toContainText(
+            language === "zh-CN" ? "2.0 KB / 未知" : "2.0 KB / Unknown",
+          );
+          for (const index of [2, 3]) {
+            await expect(metrics.nth(index).locator('[data-test="task-speed-metric"]')).toContainText("--");
+            await expect(metrics.nth(index).locator('[data-test="task-eta-metric"]')).toContainText("--");
+          }
+          await expect(page.locator('[data-test="task-category-metric"]')).toHaveCount(0);
+          expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+          const measurements = await metrics.first().evaluate((element) => {
+            const values = [...element.querySelectorAll<HTMLElement>(".task-card-metric-value, dd")];
+            const [size, speed, eta] = ["size", "speed", "eta"].map((metric) =>
+              element.querySelector(`[data-test="task-${metric}-metric"]`)!.getBoundingClientRect(),
+            );
+            const card = element.closest(".task-card, .task-desktop-card")!;
+            return {
+              valuesFit: values.every((value) => value.scrollWidth <= value.clientWidth + 1),
+              contentFitsCard: card.scrollHeight <= card.clientHeight + 1,
+              sameMetricRow: Math.abs(speed.top - eta.top) < 1,
+              sizeAbove: size.top < speed.top,
+              noOverlap: speed.right <= eta.left,
+            };
+          });
+          expect(measurements).toEqual({ valuesFit: true, contentFitsCard: true, sameMetricRow: true, sizeAbove: viewport.width < 768, noOverlap: true });
+          await page.screenshot({ path: testInfo.outputPath(`metrics-${viewport.width}.png`), fullPage: true });
+          await page.getByRole("button", { name: language === "zh-CN" ? "详情" : "Details", exact: true }).first().click();
+          const details = page.getByRole("dialog");
+          await expect(details.locator('[data-test="task-detail-summary"]')).toContainText("电影");
+          await page.waitForTimeout(250);
+          await expect(details.locator(".task-detail-summary-progress")).toContainText("25.0%");
+          const detailMeasurements = await details.evaluate((element) => {
+            const content = element.querySelector<HTMLElement>(".task-detail-card-content")!;
+            const values = [...element.querySelectorAll<HTMLElement>(".task-detail-title, .task-detail-row dd")];
+            return {
+              contentFits: content.scrollWidth <= content.clientWidth + 1,
+              valuesFit: values.every((value) => value.scrollWidth <= value.clientWidth + 1),
+            };
+          });
+          expect(detailMeasurements).toEqual({ contentFits: true, valuesFit: true });
+          expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+          const lastDetailRow = details.locator(".task-detail-row").last();
+          await lastDetailRow.scrollIntoViewIfNeeded();
+          await expect(lastDetailRow).toBeInViewport();
+          await page.screenshot({ path: testInfo.outputPath(`task-details-${viewport.width}.png`), fullPage: true });
+          await details.getByRole("button", { name: language === "zh-CN" ? "关闭" : "Close", exact: true }).last().click();
+        }
+      });
+    }
+  }
+
+  test("renders the task shell at a mobile viewport", async ({ page }) => {
+    await installFixture(page);
+    await completeLogin(page);
+
+    await expect(page.locator(".window-shell")).toBeVisible();
+    if ((page.viewportSize()?.width ?? 1024) < 768) {
+      await expect(page.locator(".mobile-actions")).toBeVisible();
+    } else {
+      await expect(page.locator(".desktop-actions")).toBeVisible();
+    }
+  });
+
+  for (const populated of [false, true]) {
+    test(`keeps category content in place throughout tab transitions with populated=${populated}`, async ({ page }) => {
+      const fixture = await installFixture(page);
+      const tasks = populated
+        ? [{ ...task, status: "active" }, { ...task, id: 2, gid: "completed-gid", status: "complete" }]
+        : [];
+      fixture.eventTasks = tasks;
+      await page.route("**/api/tasks**", (route) => {
+        const removed = new URL(route.request().url()).searchParams.get("status") === "removed";
+        return json(route, 200, removed && populated ? [{ ...task, status: "removed" }] : tasks);
+      });
+      await completeLogin(page);
+      if (populated) await expect(page.locator(".task-table")).toBeVisible();
+      else await expect(page.getByText("暂无任务", { exact: true })).toBeVisible();
+
+      for (const label of ["下载中", "已完成", "回收站", "扩展", "全部"]) {
+        const samples = await page.evaluate(async (label) => {
+          const body = document.querySelector<HTMLElement>(".main-content-body")!;
+          const stage = document.querySelector<HTMLElement>(".content-stage")!;
+          const outgoing = body.querySelector<HTMLElement>(".task-table, .empty-guide, .extensions-page")!;
+          const outgoingTop = outgoing.getBoundingClientRect().top;
+          const button = [...document.querySelectorAll<HTMLButtonElement>(".category-list button")]
+            .find((button) => button.getAttribute("aria-label") === label)!;
+          button.click();
+          const samples: { bottomGap: number; outgoingShift: number }[] = [];
+          const started = performance.now();
+          await new Promise<void>((resolve) => {
+            const sample = () => {
+              samples.push({
+                bottomGap: stage.getBoundingClientRect().bottom - body.getBoundingClientRect().bottom,
+                outgoingShift: outgoing.isConnected ? outgoing.getBoundingClientRect().top - outgoingTop : 0,
+              });
+              if (performance.now() - started < 240) requestAnimationFrame(sample);
+              else resolve();
+            };
+            requestAnimationFrame(sample);
+          });
+          return samples;
+        }, label);
+
+        expect(samples.every(({ bottomGap }) => Math.abs(bottomGap) < 1), label).toBe(true);
+        expect(samples.every(({ outgoingShift }) => Math.abs(outgoingShift) <= 4), label).toBe(true);
+      }
+    });
+  }
+
+  test("opens task details with the keyboard and closes with Escape", async ({ page }) => {
+    const fixture = await installFixture(page);
+    fixture.createdUrls.push(task.url);
+    fixture.eventTasks = [{ ...task }];
+    await completeLogin(page);
+    const details = page.getByRole("button", { name: "详情", exact: true });
+    await expect(details).toHaveAttribute("aria-label", "详情");
+    await details.focus();
+    await details.press("Enter");
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  });
+});
+
+async function completeLogin(page: Page) {
+  await page.goto("/");
+  await expect(page.locator('[data-test="auth-password"]')).toBeVisible();
+  await page.locator('[data-test="auth-password"] input').fill(password);
+  await page.locator('[data-test="auth-submit"]').click();
+  await expect(page.locator(".window-shell")).toBeVisible({ timeout: 10_000 });
+}
+
+async function installFixture(page: Page) {
+  const fixture = {
+    authenticated: false,
+    forceUnauthorized: false,
+    eventRequests: 0,
+    eventTasks: [] as (typeof task)[],
+    createdUrls: [] as string[],
+  };
+
+  await page.route("**/api/**", async (route) => {
+    await handleApiRoute(route, fixture);
+  });
+  return fixture;
+}
+
+async function handleApiRoute(
+  route: Route,
+  fixture: { authenticated: boolean; forceUnauthorized: boolean; eventRequests: number; eventTasks: (typeof task)[]; createdUrls: string[] },
+) {
+  const request = route.request();
+  const url = new URL(request.url());
+  const path = url.pathname;
+
+  if (path === "/api/events") {
+    fixture.eventRequests += 1;
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+      body: `event: tasks.snapshot\ndata: ${JSON.stringify({ revision: fixture.eventRequests, tasks: fixture.eventTasks })}\n\n`,
+    });
+    return;
+  }
+
+  if (fixture.forceUnauthorized && request.method() !== "GET" && path !== "/api/auth/status") {
+    await json(route, 401, { code: "jwt_invalid", message: "登录已失效" });
+    return;
+  }
+
+  if (path === "/api/auth/status") {
+    await json(
+      route,
+      200,
+      fixture.forceUnauthorized
+        ? { setupRequired: false, authenticated: false }
+        : fixture.authenticated
+          ? { setupRequired: false, authenticated: true }
+          : { setupRequired: false, authenticated: false },
+    );
+    return;
+  }
+  if (path === "/api/auth/login") {
+    fixture.authenticated = true;
+    await json(route, 200, { setupRequired: false, authenticated: true, accessToken });
+    return;
+  }
+  if (path === "/api/app/info") {
+    await json(route, 200, { name: "Motrix", version: "1.9.8", backendStatus: "ready", maintainer: "test", repositoryUrl: "https://example.test", releasePageUrl: "https://example.test/releases", targetArch: "x86_64", updateMode: "manual_fpk_or_app_center" });
+    return;
+  }
+  if (path === "/api/app/ping") {
+    await json(route, 200, { ok: true, message: "Rust 后端通信正常" });
+    return;
+  }
+  if (path === "/api/tasks" && request.method() === "POST") {
+    const payload = request.postDataJSON() as { url?: string };
+    const urlValue = payload.url ?? "";
+    fixture.createdUrls.push(urlValue);
+    await json(route, 200, { ...task, url: urlValue, fileName: "file.iso" });
+    return;
+  }
+  if (/^\/api\/tasks\/\d+\/file-context$/.test(path)) {
+    await json(route, 200, {
+      saveDir: { path: "/downloads", displayPath: "/downloads" }, filePath: null,
+      actions: { availability: "available", fileManagerPath: null, openFilePath: null, detailPaths: [] },
+    });
+    return;
+  }
+  if (path === "/api/tasks/batch" && request.method() === "POST") {
+    const payload = request.postDataJSON() as { urls?: string[] };
+    const urls = payload.urls ?? [];
+    fixture.createdUrls.push(...urls);
+    await json(route, 200, {
+      created: urls.map((urlValue) => ({ ...task, url: urlValue, fileName: "file.iso" })),
+      failed: [],
+    });
+    return;
+  }
+  if (path === "/api/tasks") {
+    if (fixture.forceUnauthorized) {
+      await json(route, 401, { code: "jwt_invalid", message: "登录已失效" });
+    } else {
+      await json(route, 200, fixture.eventTasks.length ? fixture.eventTasks : fixture.createdUrls.length ? [{ ...task, url: fixture.createdUrls[0] }] : []);
+    }
+    return;
+  }
+  if (path === "/api/tasks" && url.searchParams.get("status") === "removed") {
+    await json(route, 200, []);
+    return;
+  }
+  if (path === "/api/settings") {
+    await json(route, 200, { defaultDownloadDir: "/downloads", maxConcurrentDownloads: 5, httpMaxConnections: 1, connectTimeout: 60, maxTries: 5, downloadLimit: 0, uploadLimit: 0, language: "zh-CN" });
+    return;
+  }
+  if (path === "/api/storage/accessible-paths") {
+    await json(route, 200, { paths: ["/downloads"] });
+    return;
+  }
+  if (path === "/api/storage/display-paths") {
+    await json(route, 200, { paths: [{ path: "/downloads", displayPath: "/downloads" }] });
+    return;
+  }
+  if (path === "/api/aria2/process") {
+    await json(route, 200, { running: false, pid: null, binarySource: "sidecar", message: "已停止" });
+    return;
+  }
+  if (path === "/api/aria2/rpc") {
+    await json(route, 200, { connected: false, version: null, message: "Aria2 未运行" });
+    return;
+  }
+  if (path === "/api/aria2/config") {
+    await json(route, 200, { configured: true, aria2Path: null, binarySource: "sidecar", message: "" });
+    return;
+  }
+  if (path.startsWith("/api/")) {
+    await json(route, 200, {});
+    return;
+  }
+  await route.continue();
+}
+
+async function json(route: Route, status: number, body: unknown) {
+  await route.fulfill({
+    status,
+    contentType: "application/json",
+    body: JSON.stringify(body),
+  });
+}
