@@ -24,7 +24,8 @@ impl GatewayProxy {
         let socket_path = PathBuf::from(path);
         match fs::symlink_metadata(&socket_path) {
             Ok(meta) if meta.file_type().is_socket() => {
-                fs::remove_file(&socket_path).map_err(|e| format!("清理旧网关 Socket 失败：{e}"))?;
+                fs::remove_file(&socket_path)
+                    .map_err(|e| format!("清理旧网关 Socket 失败：{e}"))?;
             }
             Ok(_) => return Err("网关 Socket 位置有非 Socket 文件，不覆盖".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -36,13 +37,17 @@ impl GatewayProxy {
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))
             .map_err(|e| format!("设置网关 Socket 权限失败：{e}"))?;
         let socket_inode = fs::symlink_metadata(&socket_path)
-            .map_err(|e| format!("读取网关 Socket 信息失败：{e}"))?.ino();
+            .map_err(|e| format!("读取网关 Socket 信息失败：{e}"))?
+            .ino();
         let upstream = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), management_addr.port());
         let worker = tokio::spawn(async move {
             loop {
                 let (mut incoming, _) = match listener.accept().await {
                     Ok(pair) => pair,
-                    Err(e) => { tracing::error!("fnOS gateway accept failed: {e}"); break; }
+                    Err(e) => {
+                        tracing::error!("fnOS gateway accept failed: {e}");
+                        break;
+                    }
                 };
                 tokio::spawn(async move {
                     match TcpStream::connect(upstream).await {
@@ -56,7 +61,11 @@ impl GatewayProxy {
                 });
             }
         });
-        Ok(Some(Self { socket_path, socket_inode, worker }))
+        Ok(Some(Self {
+            socket_path,
+            socket_inode,
+            worker,
+        }))
     }
 }
 
