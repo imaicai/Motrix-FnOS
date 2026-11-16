@@ -364,14 +364,3 @@ test('Aria2 checksum 解析忽略无效行并统一哈希大小写', () => {
   assert.equal(checksums.size, 1);
   assert.equal(sha256(Buffer.from('motrix')), '21d18eea6592c920bb403ba3f94c86811ea6fefba161950a2e55a75e888759c5');
 });
-
-test('fnOS 同源网关配置不依赖 HTTP 17080 桌面 iframe', () => {
-  const config = { '.url': { 'motrix.Application': {
-    type: 'iframe', protocol: '', gatewayPrefix: '/app/motrix', gatewaySocket: 'app.sock',
-    url: '/app/motrix/?v=2.0.8', control: { accessPerm: 'editable', fullUrlPerm: 'readonly' }
-  } } };
-  const expected = { entryId: 'motrix.Application', port: '17080', url: '/?v=2.0.8', accessPerm: 'editable' };
-  assert.doesNotThrow(() => validatePortEntry(config, expected));
-  const bad = structuredClone(config); bad['.url']['motrix.Application'].port = '17080';
-  assert.throws(() => validatePortEntry(bad, expected), /不得使用 HTTP 端口/);
-});

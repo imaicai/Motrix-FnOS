@@ -315,7 +315,7 @@ function patchUiPort(uiConfigPath, servicePort, entryId) {
   if (!entry || typeof entry !== 'object') {
     fail(`应用入口配置缺少 manifest.desktop_applaunchname 对应入口：${resolvedEntryId}`);
   }
-  if (!entry.gatewayPrefix) entry.port = servicePort;
+  entry.port = servicePort;
   writeFileSync(uiConfigPath, `${JSON.stringify(config, null, 2)}\n`);
 }
 

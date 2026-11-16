@@ -50,8 +50,8 @@
 
 ## 2. 前端消费约定
 
-- 本 Fork v2.0.8 的 FPK 桌面入口通过 fnOS HTTPS 同源网关 `/app/motrix/`，API/SSE 使用 `/app/motrix/api/*`。独立 `17080` 端口仍使用 `/api/*`。
-- 仅在本 Fork 测试版，桌面入口采用 gatewayPrefix/gatewaySocket，管理服务仍监听 `17080`；公网回环 JSON-RPC `17081` 和 LAN RPC `17082` 不得用于桌面入口。是否能完成 fnOS 网关注册待实机确认。
+- FPK Web UI 从 manifest `service_port` 对应的管理端口访问后端，API 与 SSE 使用同源 `/api/*` 和 `/api/events`。
+- FPK 桌面入口与 Rust server 使用同一端口；不得再同时声明统一网关字段并把该端口限制成仅 JSON-RPC。
 - 浏览器管理请求使用 `Authorization: Bearer <JWT>`；统一 HTTP client 与 SSE 使用 `credentials: "same-origin"`，保留上游网关的同源 Cookie 传输，Motrix 自身仍只依据 JWT 校验管理权限。FN Connect 的凭据兼容与待验边界见 [故障排查](maintenance.md#常见问题)。
 - `/jsonrpc` 只存在于两个 RPC listener，不与 Web UI 共用监听器；回环反代和局域网写操作分别要求独立 Token。
 - 开发态由 Vite proxy 转发 `/api` 与 `/api/events` 到本地 server。

@@ -157,21 +157,6 @@ export function validatePortEntry(config, expected) {
   if (entry.type !== 'iframe') {
     throw new Error(`端口入口 type 必须为 iframe，实际为 ${entry.type ?? '(missing)'}`);
   }
-  if (entry.gatewayPrefix !== undefined || entry.gatewaySocket !== undefined) {
-    if (entry.gatewayPrefix !== '/app/motrix' || entry.gatewaySocket !== 'app.sock') {
-      throw new Error('不得声明 gatewayPrefix 或 gatewaySocket，除非使用 /app/motrix + app.sock');
-    }
-    if (entry.protocol !== '' || Object.hasOwn(entry, 'port')) {
-      throw new Error('fnOS 网关入口不得使用 HTTP 端口模式');
-    }
-    if (entry.url !== `/app/motrix/${expected.url.slice(1)}`) {
-      throw new Error(`fnOS 网关入口 URL 无效：${entry.url}`);
-    }
-    if (entry.control?.accessPerm !== 'editable' || entry.control?.fullUrlPerm !== 'readonly') {
-      throw new Error('fnOS 网关入口权限必须是 readonly');
-    }
-    return;
-  }
   if (entry.protocol !== 'http') {
     throw new Error(`端口入口 protocol 必须为 http，实际为 ${entry.protocol ?? '(missing)'}`);
   }

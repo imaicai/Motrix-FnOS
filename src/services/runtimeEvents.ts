@@ -1,5 +1,4 @@
 import { useTaskStore } from "../features/tasks/stores/taskStore";
-import { resolveApiPath } from "./apiBase";
 import type { DownloadTask } from "../types/tasks";
 import type { AuthStatus } from "../features/auth/types";
 import type { AppCompatibility } from "../types/app";
@@ -54,7 +53,7 @@ async function connect(controller: AbortController, currentGeneration: number) {
 
   let response: Response;
   try {
-    response = await fetch(resolveApiPath("/api/events"), {
+    response = await fetch("/api/events", {
       method: "GET",
       // SSE passes through the same gateway as ordinary API requests.
       credentials: "same-origin",

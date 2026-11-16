@@ -68,8 +68,7 @@ export function setProjectVersion(version, files = versionFiles) {
 
   const uiConfig = readJson(files.uiConfig);
   const uiEntry = readUiEntry(uiConfig, files.uiConfig);
-  const prefix = uiEntry.url.startsWith("/app/motrix/") ? "/app/motrix/" : "/";
-  uiEntry.url = `${prefix}?v=${version}`;
+  uiEntry.url = `/?v=${version}`;
   writeJson(files.uiConfig, uiConfig);
 }
 
@@ -101,7 +100,7 @@ function readUiCacheVersion(uiConfig, filePath) {
   if (typeof url !== 'string') {
     throw new Error(`无法读取版本号：${filePath}`);
   }
-  return matchRequired(url, /^\/(?:app\/motrix\/)?\?v=(\d+\.\d+\.\d+(?:-beta)?)$/, filePath);
+  return matchRequired(url, /^\/\?v=(\d+\.\d+\.\d+(?:-beta)?)$/, filePath);
 }
 
 function readUiEntry(uiConfig, filePath) {

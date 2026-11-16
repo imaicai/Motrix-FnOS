@@ -4,17 +4,16 @@
       "title": "Motrix",
       "icon": "images/icon_{0}.png",
       "type": "iframe",
-      "protocol": "",
-      "url": "/app/motrix/?v=2.0.8",
+      "protocol": "http",
+      "port": "17080",
+      "url": "/?v=2.0.7",
       "allUsers": false,
       "control": {
         "accessPerm": "editable",
-        "fullUrlPerm": "readonly",
+        "fullUrlPerm": "editable",
         "portPerm": "readonly",
         "pathPerm": "readonly"
-      },
-      "gatewayPrefix": "/app/motrix",
-      "gatewaySocket": "app.sock"
+      }
     }
   }
 }

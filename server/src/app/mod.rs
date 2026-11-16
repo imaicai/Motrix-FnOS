@@ -48,7 +48,6 @@ pub const JSONRPC_WEBSOCKET_CONNECTION_LIMIT: usize = 64;
 const RUNTIME_EVENT_BUFFER: usize = 32;
 
 pub mod compatibility;
-mod gateway;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerRuntimeConfig {
@@ -600,14 +599,6 @@ pub async fn run_server() -> Result<(), String> {
     let _process_lock = ServerProcessLock::acquire(&runtime.app_data_dir)?;
     let state = bootstrap_http_app_state(&runtime).await?;
     let listeners = bind_http_listeners(&runtime).await?;
-    // fnOS HTTPS 桌面使用 Unix Socket，绑定失败时仍保留 17080。
-    let _gateway_proxy = match gateway::GatewayProxy::start(runtime.http_addr) {
-        Ok(proxy) => proxy,
-        Err(error) => {
-            tracing::error!("fnOS 网关初始化失败，17080 仍可用：{error}");
-            None
-        }
-    };
     state
         .lan_jsonrpc_port_in_use
         .store(listeners.lan_jsonrpc.is_none(), Ordering::Relaxed);

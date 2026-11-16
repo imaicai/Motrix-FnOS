@@ -185,7 +185,7 @@ prepare 拒绝无关脏工作区，目标必须是更高正式版本；复用现
 ### FPK 身份与图标
 
 - 配套身份为 `appname=motrix`、`desktop_appname=motrix.Application`、空 `desktop_applaunchname`，`app/ui/config` 的 `.url` 只有同名 `motrix.Application` iframe 入口。不能只改其中一个字段；空 launchname 时构建器须验证唯一入口。
-- `service_port` 与入口 port 为管理端口 `17080`，本 Fork 的测试桌面入口使用 `gatewayPrefix=/app/motrix`、`gatewaySocket=app.sock`，保留独立服务端口 `17080`。`MotrixFNOS.sc` 为 `17080/tcp,17082/tcp`；回环 `17081` 不进入 manifest、桌面入口或平台端口映射。运行时限制见 [接口约定](api-contract.md#1-运行时约定)。
+- `service_port` 与入口 port 为管理端口 `17080`，入口 `protocol=http`、`url=/?v=<version>`，Web 基址保持 `./`。`MotrixFNOS.sc` 为 `17080/tcp,17082/tcp`；回环 `17081` 不进入 manifest、桌面入口或平台端口映射。运行时限制见 [接口约定](api-contract.md#1-运行时约定)。
 - 该身份的 FN Connect 地址 `https://motrix.<account>.fnos.net/` 已有实机依据。桌面入口默认 `allUsers=false`，`control.accessPerm=editable` 可由管理员放开；不因此获得可信 `X-Trim-*` 身份。
 - 双架构 `os_min_version=1.2.0401`，不承诺支持 `1.2.0302`；正式包声明 `micro_app=true`，精确申请 `trim.file.sharedAccess`、`trim.file.path`。预检拒绝额外 Scope，扫描 Web 产物，禁止 `TRIM_API_TOKEN`、官方 Socket 路径和官方开放 API 的 Authorization Header 拼装代码进入产物。
 - 包根 `ICON.PNG` / `ICON_256.PNG`、入口 `app/ui/images/icon_64.png` / `icon_256.png` 及 Web `icon.png`，项目交付均为 **256×256**，由构建器同步校验；保留 `images/icon_{0}.png` 兼容文件名。
@@ -377,7 +377,3 @@ getVersion 匿名可用不代表写鉴权关闭；写方法及 multicall 子调�
 | addUri Token 错误 | 核对公网 Token，不能用 LAN Token 或 Aria2 secret |
 
 参考：[Cloudflare DDNS](https://developers.cloudflare.com/dns/manage-dns-records/how-to/managing-dynamic-ip-addresses/)、[Origin CA](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)、[代理端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)、[Lucky DDNS](https://lucky666.cn/docs/modules/ddns)。
-
-### 本 Fork 的 HTTPS 桌面窗口白屏测试版
-
-参阅 [v2.0.8 网关改造、安装备份、日志排查与真机验收](fnos-desktop-gateway.md)。原仓库此处有关仅端口入口、不允许 gatewayPrefix 的记述适用于原版拓扑；本 Fork 的新增网关路径尚未实机验收。
