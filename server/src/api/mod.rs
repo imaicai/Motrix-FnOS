@@ -194,7 +194,9 @@ fn management_router_with_static_dir(state: Arc<HttpAppState>, static_dir: PathB
     .fallback(api_not_found);
 
     Router::new()
-        .nest("/api", api_routes)
+        .nest("/api", api_routes.clone())
+        .nest("/app/motrix/api", api_routes)
+        .nest_service("/app/motrix", ServeDir::new(static_dir.clone()))
         .fallback_service(ServeDir::new(static_dir))
         .layer(middleware::from_fn(request_context))
         .layer(middleware::from_fn(no_cache_headers))
