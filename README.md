@@ -1,3 +1,11 @@
+> **imaicai Fork · v2.0.8 测试版（非原作者官方发布）**
+>
+> 基于 [RockerHX/motrix-fnos](https://github.com/RockerHX/motrix-fnos) v2.0.7 的完整源码。尝试修复通过 HTTPS 访问飞牛桌面时，Motrix 内嵌窗口白屏、独立 17080 端口却正常的问题。**尚待真实 fnOS 设备验收；请在备份后测试，勿当作稳定发布。**
+>
+> **获取安装包：** [Releases](https://github.com/imaicai/Motrix-FnOS/releases)（仅提供通过 GitHub Actions 构建和校验的 x86 / ARM 测试 FPK）；[完整修复方案、升级与验收指南](docs/fnos-desktop-gateway.md)。
+
+---
+
 # Motrix FNOS
 
 Motrix FNOS 是面向飞牛 fnOS 的下载管理应用，内置 Aria2 Next 下载引擎，以 FPK 形式安装和运行。用户通过同一套 Web UI 在桌面浏览器、手机浏览器或飞牛 App 中管理下载任务。
