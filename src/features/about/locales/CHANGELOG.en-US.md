@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.8 - 2026-11-16
+
+### Fixed
+
+- Added an experimental same-origin fnOS HTTPS desktop gateway via Unix Socket and updated API/SSE paths to address the blank embedded window.
+
+### Documentation
+
+- Added installation, backup, FPK build, and hardware acceptance instructions for this independent test fork.
 ## 2.0.7
 
 ### Fixed
@@ -9,6 +18,7 @@
 - Localized API errors, task recovery warnings, proxy failures, update checks, and engine status messages while preserving original diagnostic data.
 - Added English in-app release notes that follow the selected interface language.
 - Removed fnOS branding from the app icon while keeping the Motrix disk design.
+- Refined the wording and translations of error messages to make them more precise.
 
 ## 2.0.6 - 2026-11-12
 
