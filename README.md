@@ -1,4 +1,4 @@
-> **imaicai Fork · v2.0.8 测试版（非原作者官方发布）**
+> **imaicai Fork · v2.0.9 测试版（非原作者官方发布）**
 >
 > 基于 [RockerHX/motrix-fnos](https://github.com/RockerHX/motrix-fnos) v2.0.7 的完整源码。尝试修复通过 HTTPS 访问飞牛桌面时，Motrix 内嵌窗口白屏、独立 17080 端口却正常的问题。**尚待真实 fnOS 设备验收；请在备份后测试，勿当作稳定发布。**
 >

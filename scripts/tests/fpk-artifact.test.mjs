@@ -140,6 +140,13 @@ function validateArtifact({ file, platform, machine }, extractionRoot) {
   assert.equal(desktopEntry?.control?.accessPerm, 'readonly');
   assert.match(readFileSync(path.join(packageRoot, 'cmd/common.sh'), 'utf8'), /MOTRIX_FNOS_GATEWAY_SOCKET/);
   assert.deepEqual(readdirSync(path.join(appRoot, 'data')), [], 'app/data 不得携带运行时残留');
+  // Verify real packed HTML paths: fnOS may open /app/motrix without a trailing slash.
+  // Relative "./assets" would escape the gateway prefix and cause a blank window.
+  const builtHtml = readFileSync(path.join(appRoot, 'ui/dist/index.html'), 'utf8');
+  assert.match(builtHtml, /(?:src|href)="\/app\/motrix\/assets\/[^"]+"/,
+    'FPK HTML must use an absolute /app/motrix/assets/ prefix');
+  assert.doesNotMatch(builtHtml, /(?:src|href)="\.\/assets\//,
+    'FPK HTML must not rely on a trailing slash for its scripts or styles');
   assertFrontendContainsNoFnosApiSecrets(path.join(appRoot, 'ui/dist'));
 }
 
