@@ -1,9 +1,6 @@
 name: Import upstream Motrix FNOS sources
 
 on:
-  push:
-    paths:
-      - '.github/workflows/import-upstream.yml'
   workflow_dispatch:
 
 permissions:
@@ -25,6 +22,11 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Never overwrite an already imported/patched repository.
+          if test -f server/src/app/gateway.rs; then
+            echo 'Patched repository already exists; refusing to re-import.'
+            exit 0
+          fi
           git remote add upstream https://github.com/RockerHX/motrix-fnos.git
           git fetch --depth=1 upstream main
           echo "Upstream commit: $(git rev-parse FETCH_HEAD)"
